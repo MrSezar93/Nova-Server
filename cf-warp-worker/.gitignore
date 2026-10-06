@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.tmp-tests/
+.wrangler/
+.dev.vars
+*.local
+.DS_Store
+
+.preview/
+
+.tmp-e2e/

@@ -1,0 +1,25 @@
+{
+  "name": "nova-warp-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker: WARP/WireGuard config server + management panel (Nova Server)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "build:single": "node scripts/build.mjs --single",
+    "test": "node scripts/test.mjs",
+    "kv:create": "wrangler kv namespace create WARP_KV",
+    "tail": "wrangler tail",
+    "preview": "node scripts/preview.mjs"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "esbuild": "^0.25.0",
+    "qrcode": "^1.5.4",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.20.0"
+  }
+}
