@@ -10,6 +10,11 @@
  *   /qr/:token.svg         QR code (SVG)
  *   /sub/:token            base64 subscription payload
  *   /healthz               health probe
+ *
+ * The configured proxy path (default `/ws`) is intercepted before the router:
+ * a WebSocket upgrade carrying VLESS is piped to the real destination through
+ * the runtime's TCP socket API. Anything else on that path (probes, scanners)
+ * falls through and sees the ordinary panel 404 page.
  */
 
 import {
@@ -48,17 +53,26 @@ import {
 import { Store } from "./lib/store";
 import {
   bindLicense,
+  buildProxyEndpoint,
   createClients,
   identitySummary,
   importIdentity,
   isDemoMode,
+  proxySummary,
   registerNewIdentity,
   renderForClient,
   rotateClient,
   syncIdentity,
 } from "./lib/service";
+import { awgEnabled, normalizeAwg, type AwgOptions } from "./lib/awg";
+import {
+  detectProxyTarget,
+  handleVlessSession,
+  normalizeProxyPath,
+  vlessLink,
+} from "./lib/proxy";
 import { WarpApiError } from "./lib/warp";
-import { isConfigFormat, type ConfigFormat } from "./lib/wg";
+import { configExtension, isConfigFormat, type ConfigFormat } from "./lib/wg";
 import { qrSvg } from "./lib/qr";
 import { normalizeLang } from "./ui/i18n";
 import {
@@ -165,16 +179,28 @@ router.get("/api/v1/state", async (context) => {
     context.store.listLogs(),
   ]);
   const apiKey = auth.viaApiKey ? undefined : (await getApiKey(context.env, context.store)) ?? undefined;
+  const host = requestHost(context.url);
+  const warpClients = clients.filter((client) => client.kind !== "proxy");
+  const proxyClients = clients.filter((client) => client.kind === "proxy");
   return json({
     settings,
     persistent: context.store.persistent,
     demo: isDemoMode(context.env),
     apiKey,
     identities: identities.map(identitySummary),
-    clients: clients.map(publicClient),
+    clients: warpClients.map(publicClient),
+    proxies: proxyClients.map((client) => publicProxy(settings, client, host)),
+    proxy: {
+      path: normalizeProxyPath(settings.proxyPath),
+      port: settings.proxyPort,
+      host: settings.proxyDomain?.trim() || host,
+      padding: Boolean(settings.proxyPadding),
+      sockets: true,
+    },
     logs,
     stats: {
-      clients: clients.length,
+      clients: warpClients.length,
+      proxies: proxyClients.length,
       identities: identities.length,
       plus: identities.filter((identity) => identity.account?.warpPlus).length,
       views: clients.reduce((total, client) => total + (client.views || 0), 0),
@@ -231,6 +257,23 @@ router.put("/api/v1/settings", async (context) => {
     next.registrationLimitPerHour =
       optionalNumber(body.registrationLimitPerHour, "registrationLimitPerHour", 1, 60) ?? 6;
   }
+  if (body.awg !== undefined && typeof body.awg === "object" && body.awg) {
+    const incoming = body.awg as Partial<AwgOptions>;
+    const reshuffle = incoming.enabled && (body.awgRandomize === true || body.awgRandomize === "true");
+    const merged = normalizeAwg({ ...next.awg, ...incoming }, next.awg);
+    next.awg = reshuffle ? awgEnabled(merged) : merged;
+  }
+  if (body.awgRandomize === true || body.awgRandomize === "true") {
+    next.awg = awgEnabled(next.awg);
+  }
+  if (body.proxyPath !== undefined) next.proxyPath = normalizeProxyPath(String(body.proxyPath));
+  if (body.proxyPort !== undefined) {
+    next.proxyPort = optionalNumber(body.proxyPort, "proxyPort", 1, 65535) ?? 443;
+  }
+  if (body.proxyDomain !== undefined) {
+    next.proxyDomain = String(body.proxyDomain).trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "") || undefined;
+  }
+  if (body.proxyPadding !== undefined) next.proxyPadding = Boolean(body.proxyPadding);
 
   await context.store.saveSettings(next);
   await context.store.addLog({ level: "info", message: "تنظیمات پنل به‌روزرسانی شد." });
@@ -414,6 +457,66 @@ router.delete("/api/v1/clients/:id", async (context) => {
 });
 
 /* -------------------------------------------------------------------------- */
+/*                              proxy (VLESS) API                             */
+/* -------------------------------------------------------------------------- */
+
+/** Finds the proxy client that owns a VLESS UUID. */
+async function findProxyByUuid(store: Store, uuid: string): Promise<ClientRecord | null> {
+  const clients = await store.listClients();
+  return clients.find((client) => client.kind === "proxy" && client.uuid === uuid) ?? null;
+}
+
+router.get("/api/v1/proxies", async (context) => {
+  await requireAuth(context);
+  const settings = await effectiveSettings(context.env, context.store);
+  const host = requestHost(context.url);
+  const clients = (await context.store.listClients()).filter((client) => client.kind === "proxy");
+  return json({ proxies: clients.map((client) => publicProxy(settings, client, host)) });
+});
+
+router.post("/api/v1/proxies", async (context) => {
+  await requireAuth(context);
+  assertSameOrigin(context.request, context.url);
+  const body = await readJson<{ name?: string; count?: number }>(context.request);
+  const result = await createClients(context.env, context.store, {
+    name: typeof body.name === "string" ? body.name : undefined,
+    count: optionalNumber(body.count, "count", 1, 25),
+    kind: "proxy",
+  });
+  const settings = await effectiveSettings(context.env, context.store);
+  const host = requestHost(context.url);
+  return json({ proxies: result.clients.map((client) => publicProxy(settings, client, host)) }, { status: 201 });
+});
+
+router.get("/api/v1/proxies/:id/links", async (context) => {
+  await requireAuth(context);
+  const client = await context.store.getClient(context.params.id);
+  if (!client || client.kind !== "proxy") throw new HttpError(404, "پروکسی پیدا نشد.");
+  const settings = await effectiveSettings(context.env, context.store);
+  const host = requestHost(context.url);
+  const requested = context.url.searchParams.get("format") ?? "vless";
+  const content =
+    requested === "vless" || requested === "wg" || requested === "amneziawg"
+      ? vlessLink(buildProxyEndpoint(settings, client, host))
+      : renderForClient(settings, null, client, requested as ConfigFormat, host);
+  return json({
+    format: requested,
+    content,
+    proxy: publicProxy(settings, client, host),
+  });
+});
+
+router.post("/api/v1/proxies/:id/rotate", async (context) => {
+  await requireAuth(context);
+  assertSameOrigin(context.request, context.url);
+  const client = await context.store.getClient(context.params.id);
+  if (!client || client.kind !== "proxy") throw new HttpError(404, "پروکسی پیدا نشد.");
+  const updated = await rotateClient(context.env, context.store, client);
+  const settings = await effectiveSettings(context.env, context.store);
+  return json({ proxy: publicProxy(settings, updated, requestHost(context.url)) });
+});
+
+/* -------------------------------------------------------------------------- */
 /*                             public profile links                           */
 /* -------------------------------------------------------------------------- */
 
@@ -443,6 +546,48 @@ router.get("/c/:token", async (context) => {
     );
   }
   const settings = settingsEarly;
+
+  if (client.kind === "proxy") {
+    const host = requestHost(context.url);
+    const endpoint = buildProxyEndpoint(settings, client, host);
+    const link = vlessLink(endpoint);
+    let svg: string | null = null;
+    let qrError: string | undefined;
+    try {
+      svg = qrSvg(link, { ecLevel: "L", scale: 4, margin: 2, title: client.name });
+    } catch (error) {
+      qrError = "لینک برای کیو‌آر کد بزرگ‌تر از حد مجاز است.";
+      void error;
+    }
+    if (!client.lastViewedAt || Date.now() - client.lastViewedAt > 120_000) {
+      client.views = (client.views || 0) + 1;
+      client.lastViewedAt = Date.now();
+      context.waitUntil(context.store.saveClient(client).catch(() => undefined));
+    }
+    const origins = [link];
+    return htmlResponse(
+      renderSharePage({
+        panelTitle: settings.title,
+        lang: panelLang(settings),
+        client,
+        identity: null,
+        kindBadge: "VLESS + WS + TLS",
+        subscriptionUrl: `/sub/${client.shareToken}`,
+        qrSvg: svg,
+        qrError,
+        configs: [
+          {
+            format: "json",
+            label: "لینک اتصال (VLESS)",
+            extension: "txt",
+            content: origins.join("\n"),
+            hint: "این لینک را در v2rayNG / NekoBox / Hiddify / Streisand / Clash.Meta وارد کنید یا QR را اسکن کنید.",
+          },
+        ],
+      }),
+    );
+  }
+
   const identity = await context.store.getIdentity(client.identityId);
   if (!identity) {
     return htmlResponse(
@@ -459,7 +604,7 @@ router.get("/c/:token", async (context) => {
   const formats: ConfigFormat[] = requested && isConfigFormat(requested) ? [requested] : ["wg"];
   const configs = formats.map((format) => ({
     format,
-    content: renderForClient(settings, identity, client, format),
+    content: renderForClient(settings, identity, client, format, requestHost(context.url)),
   }));
 
   let svg: string | null = null;
@@ -485,6 +630,7 @@ router.get("/c/:token", async (context) => {
       client,
       identity,
       configs,
+      subscriptionUrl: `/sub/${client.shareToken}`,
       qrSvg: svg,
       qrError,
     }),
@@ -495,13 +641,18 @@ router.get("/c/:token/raw", async (context) => {
   const client = await context.store.getClientByToken(context.params.token);
   if (!client) throw new HttpError(404, "لینک پیدا نشد.");
   if (!client.enabled) throw new HttpError(403, "این لینک موقتاً غیرفعال شده است.");
+  const settings = await effectiveSettings(context.env, context.store);
+  const host = requestHost(context.url);
+  if (client.kind === "proxy") {
+    const endpoint = buildProxyEndpoint(settings, client, host);
+    return downloadResponse(vlessLink(endpoint), `${client.name}.txt`, "text/plain; charset=utf-8");
+  }
   const identity = await context.store.getIdentity(client.identityId);
   if (!identity) throw new HttpError(410, "هویت این کانفیگ حذف شده است.");
-  const settings = await effectiveSettings(context.env, context.store);
   const requested = context.url.searchParams.get("format");
   const format = requested && isConfigFormat(requested) ? requested : client.format;
-  const content = renderForClient(settings, identity, client, format);
-  const extension = format === "wg" ? "conf" : format === "clash" ? "yaml" : "json";
+  const content = renderForClient(settings, identity, client, format, host);
+  const extension = configExtension(format);
   return downloadResponse(content, `${client.name}.${extension}`, "text/plain; charset=utf-8");
 });
 
@@ -510,12 +661,13 @@ router.get("/qr/:token", async (context) => {
   const client = await context.store.getClientByToken(token);
   if (!client) throw new HttpError(404, "لینک پیدا نشد.");
   if (!client.enabled) throw new HttpError(403, "این لینک موقتاً غیرفعال شده است.");
-  const identity = await context.store.getIdentity(client.identityId);
-  if (!identity) throw new HttpError(410, "هویت این کانفیگ حذف شده است.");
   const settings = await effectiveSettings(context.env, context.store);
+  const host = requestHost(context.url);
+  const identity = client.kind === "proxy" ? null : await context.store.getIdentity(client.identityId);
+  if (!identity && client.kind !== "proxy") throw new HttpError(410, "هویت این کانفیگ حذف شده است.");
   const requested = context.url.searchParams.get("format");
   const format = requested && isConfigFormat(requested) ? requested : client.format;
-  const content = renderForClient(settings, identity, client, format);
+  const content = renderForClient(settings, identity, client, format, host);
   let svg: string;
   try {
     svg = qrSvg(content, { ecLevel: "L", scale: 4, margin: 2, title: client.name });
@@ -533,10 +685,28 @@ router.get("/sub/:token", async (context) => {
   const client = await context.store.getClientByToken(context.params.token);
   if (!client) throw new HttpError(404, "لینک پیدا نشد.");
   if (!client.enabled) throw new HttpError(403, "این لینک موقتاً غیرفعال شده است.");
-  const identity = await context.store.getIdentity(client.identityId);
-  if (!identity) throw new HttpError(410, "هویت این کانفیگ حذف شده است.");
   const settings = await effectiveSettings(context.env, context.store);
-  const content = renderForClient(settings, identity, client, "wg");
+  const host = requestHost(context.url);
+  const requested = context.url.searchParams.get("format");
+  // Proxy clients have a real subscription format (a list of vless:// links),
+  // WARP clients get their WireGuard profile base64-encoded.
+  const asProxy = client.kind === "proxy";
+  const format: ConfigFormat = requested && isConfigFormat(requested)
+    ? requested
+    : asProxy
+      ? "json"
+      : "wg";
+  if (asProxy && requested && (requested === "clash" || requested === "singbox" || requested === "xray")) {
+    const content = renderForClient(settings, null, client, format, host);
+    return textResponse(content, {
+      headers: { "cache-control": "no-store", "content-type": requested === "clash" ? "text/yaml; charset=utf-8" : "application/json; charset=utf-8" },
+    });
+  }
+  const identity = asProxy ? null : await context.store.getIdentity(client.identityId);
+  if (!identity && !asProxy) throw new HttpError(410, "هویت این کانفیگ حذف شده است.");
+  const content = asProxy
+    ? vlessLink(buildProxyEndpoint(settings, client, host))
+    : renderForClient(settings, identity, client, format, host);
   const encoded = btoa(String.fromCharCode(...new TextEncoder().encode(content)));
   return textResponse(encoded, { headers: { "cache-control": "no-store" } });
 });
@@ -710,6 +880,25 @@ function parseList(value: string): string[] {
     .slice(0, 64);
 }
 
+/** The hostname the panel is currently served on (used for proxy links). */
+function requestHost(url: URL): string {
+  return url.host.replace(/:\d+$/, "");
+}
+
+function publicProxy(settings: PanelSettings, client: ClientRecord, host: string) {
+  return {
+    id: client.id,
+    name: client.name,
+    kind: "proxy" as const,
+    shareToken: client.shareToken,
+    enabled: client.enabled,
+    createdAt: client.createdAt,
+    views: client.views || 0,
+    note: client.note,
+    ...proxySummary(settings, client, host),
+  };
+}
+
 function publicClient(client: ClientRecord) {
   return {
     id: client.id,
@@ -744,6 +933,22 @@ export default {
       params: {},
       waitUntil: (promise) => ctx.waitUntil(promise),
     };
+
+    // Built-in VLESS-over-WebSocket proxy: intercept the upgrade before the
+    // router. Unknown UUIDs / other paths fall through to the normal 404 page.
+    const proxyTarget = detectProxyTarget(request, url, (await store.getSettings()).proxyPath);
+    if (proxyTarget.candidate && proxyTarget.uuid) {
+      const client = await findProxyByUuid(store, proxyTarget.uuid);
+      if (client?.enabled) {
+        return handleVlessSession(request, {
+          debug: env.PROXY_DEBUG === "1",
+          waitUntil: (promise) => ctx.waitUntil(promise as Promise<unknown>),
+        });
+      }
+      if (client && !client.enabled) {
+        return new Response("proxy disabled", { status: 403, headers: { "cache-control": "no-store" } });
+      }
+    }
 
     const matched = router.match(request.method, url.pathname);
     if (!matched) {

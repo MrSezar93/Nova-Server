@@ -11,7 +11,7 @@ export const CLIENT_SCRIPT = String.raw`
 
   var boot = window.__NOVA__ || { t: {}, lang: 'fa', demo: false };
   var T = boot.t || {};
-  var state = { settings: {}, identities: [], clients: [], logs: [], stats: {}, persistent: true };
+  var state = { settings: {}, identities: [], clients: [], proxies: [], logs: [], stats: {}, persistent: true, proxy: {} };
   var activeTab = 'dashboard';
 
   function t(key) { return T[key] || key; }
@@ -137,6 +137,8 @@ export const CLIENT_SCRIPT = String.raw`
       state.settings = data.settings || {};
       state.identities = data.identities || [];
       state.clients = data.clients || [];
+      state.proxies = data.proxies || [];
+      state.proxy = data.proxy || {};
       state.logs = data.logs || [];
       state.stats = data.stats || {};
       state.persistent = data.persistent !== false;
@@ -145,6 +147,17 @@ export const CLIENT_SCRIPT = String.raw`
     }).catch(function (err) {
       toast(err.message, 'error');
     });
+  }
+
+  function proxyById(id) {
+    for (var i = 0; i < state.proxies.length; i++) {
+      if (state.proxies[i].id === id) return state.proxies[i];
+    }
+    return null;
+  }
+
+  function proxySubscriptionUrl(proxy) {
+    return location.origin + '/sub/' + proxy.shareToken;
   }
 
   function identityById(id) {
@@ -166,7 +179,7 @@ export const CLIENT_SCRIPT = String.raw`
       h('span', { class: 'pill muted', text: (identityById(client.identityId) || {}).addressV4 || '-' })
     ]));
 
-    var formats = ['wg', 'singbox', 'clash', 'xray', 'json'];
+    var formats = ['wg', 'amneziawg', 'singbox', 'clash', 'xray', 'json'];
     var tabsRow = h('div', { class: 'row' });
     var pre = h('pre', { text: t('loading') });
     var qrBox = h('div', { class: 'qr' });
@@ -205,7 +218,7 @@ export const CLIENT_SCRIPT = String.raw`
         pre,
         h('div', { class: 'row' }, [
           h('button', { class: 'small primary', text: t('copy'), onclick: function () { copy(current); } }),
-          h('button', { class: 'small', text: t('download'), onclick: function () { download(client.name + '.' + (selected === 'clash' ? 'yaml' : (selected === 'wg' ? 'conf' : 'json')), current); } }),
+          h('button', { class: 'small', text: t('download'), onclick: function () { download(client.name + '.' + (selected === 'clash' ? 'yaml' : ((selected === 'wg' || selected === 'amneziawg') ? 'conf' : 'json')), current); } }),
           h('button', { class: 'small ghost', text: t('copyLink'), onclick: function () { copy(location.origin + '/c/' + client.shareToken, t('copied')); } })
         ])
       ]),
@@ -215,11 +228,81 @@ export const CLIENT_SCRIPT = String.raw`
     load(selected);
   }
 
+  function showProxyModal(proxy) {
+    var linkInput = h('textarea', { readonly: true, style: 'min-height:70px' });
+    linkInput.value = proxy.url || '';
+    var link = proxy.url || '';
+    var content = h('div', { class: 'stack' }, [
+      h('div', { class: 'row' }, [
+        h('span', { class: 'pill', text: proxy.name }),
+        h('span', { class: 'pill ok', text: 'VLESS + WS + TLS' }),
+        h('span', { class: 'pill muted', text: proxy.host + ':' + proxy.port })
+      ]),
+      h('div', {}, [h('label', { text: t('proxyLink') }), linkInput]),
+      h('p', { class: 'small-hint', text: t('proxyApps') }),
+      h('div', { class: 'row' }, [
+        h('button', { class: 'small primary', text: t('copy'), onclick: function () { copy(link); } }),
+        h('button', { class: 'small', text: t('download'), onclick: function () { download(proxy.name + '.txt', link); } }),
+        h('a', { href: '/c/' + proxy.shareToken, target: '_blank', rel: 'noreferrer', style: 'text-decoration:none' }, [
+          h('button', { class: 'small ghost', text: t('showLink') })
+        ])
+      ]),
+      h('div', { class: 'split' }, [
+        h('div', { class: 'stack' }, [
+          h('div', { class: 'muted tiny', text: t('proxySubHint') }),
+          h('div', { class: 'mono tiny', style: 'word-break:break-all', text: proxySubscriptionUrl(proxy) }),
+          h('div', { class: 'row' }, [
+            h('button', { class: 'small ghost', text: t('copy'), onclick: function () { copy(proxySubscriptionUrl(proxy)); } }),
+            h('button', { class: 'small ghost', text: 'QR', onclick: function () { window.open('/qr/' + proxy.shareToken + '.svg', '_blank'); } })
+          ]),
+          h('div', { class: 'muted tiny', text: t('proxyUuid') + ': ' + (proxy.uuid || '') })
+        ]),
+        h('div', { class: 'qr' }, [h('img', { src: '/qr/' + proxy.shareToken + '.svg', alt: t('qrCode'), style: 'width:min(260px,60vw)' })])
+      ]),
+      h('div', { class: 'row' }, [
+        h('button', { class: 'ghost', text: t('cancel'), onclick: closeModal })
+      ])
+    ]);
+    openModal(proxy.name, content);
+  }
+
+  function createProxyForm() {
+    var nameInput = h('input', { placeholder: 'proxy-1' });
+    var countInput = h('input', { type: 'number', min: '1', max: '25', value: '1' });
+    var form = h('div', { class: 'stack' }, [
+      h('div', { class: 'grid' }, [
+        h('div', {}, [h('label', { text: t('clientName') }), nameInput]),
+        h('div', {}, [h('label', { text: t('proxyCount') }), countInput])
+      ]),
+      h('p', { class: 'small-hint', text: t('serviceHint') }),
+      h('div', { class: 'row' }, [
+        h('button', {
+          class: 'primary',
+          text: t('newProxy'),
+          onclick: function (event) {
+            var button = event.currentTarget;
+            button.disabled = true;
+            api('/proxies', { method: 'POST', body: { name: nameInput.value, count: Number(countInput.value) || 1 } })
+              .then(function (result) {
+                closeModal();
+                toast(t('success') + ' · ' + result.proxies.length, 'success');
+                return loadState();
+              })
+              .catch(function (err) { toast(err.message, 'error'); })
+              .then(function () { button.disabled = false; });
+          }
+        }),
+        h('button', { class: 'ghost', text: t('cancel'), onclick: closeModal })
+      ])
+    ]);
+    openModal(t('newProxy'), form);
+  }
+
   function createClientForm() {
     var nameInput = h('input', { placeholder: state.settings.namePrefix + '-1' });
     var countInput = h('input', { type: 'number', min: '1', max: '25', value: '1' });
     var formatSelect = h('select');
-    ['wg', 'singbox', 'clash', 'xray', 'json'].forEach(function (format) {
+    ['wg', 'amneziawg', 'singbox', 'clash', 'xray', 'json'].forEach(function (format) {
       formatSelect.appendChild(h('option', { value: format, text: format, selected: format === (state.settings.defaultFormat || 'wg') }));
     });
     var identitySelect = h('select');
@@ -227,6 +310,14 @@ export const CLIENT_SCRIPT = String.raw`
     state.identities.forEach(function (identity) {
       identitySelect.appendChild(h('option', { value: identity.id, text: identity.name + (identity.addressV4 ? ' — ' + identity.addressV4 : '') }));
     });
+
+    var awgSelect = h('select');
+    var awgDefaults = state.settings.awg || {};
+    [['off', t('awgOff')], ['warp-safe', t('awgWarpSafe')], ['custom', t('awgCustom')]].forEach(function (pair) {
+      var selected = pair[0] === 'off' ? !awgDefaults.enabled : (awgDefaults.enabled && ((awgDefaults.mode === 'custom') === (pair[0] === 'custom')));
+      awgSelect.appendChild(h('option', { value: pair[0], text: pair[1], selected: selected }));
+    });
+    var warn = h('p', { class: 'small-hint', text: t('awgHint') });
 
     var form = h('div', { class: 'stack' }, [
       h('div', { class: 'grid' }, [
@@ -237,6 +328,7 @@ export const CLIENT_SCRIPT = String.raw`
         h('div', {}, [h('label', { text: t('format') }), formatSelect]),
         h('div', {}, [h('label', { text: t('identity') }), identitySelect])
       ]),
+      h('div', {}, [h('label', { text: t('awgTitle') }), awgSelect, warn]),
       h('p', { class: 'small-hint', text: t('bulkHint') }),
       h('div', { class: 'row' }, [
         h('button', {
@@ -245,13 +337,22 @@ export const CLIENT_SCRIPT = String.raw`
           onclick: function (event) {
             var button = event.currentTarget;
             button.disabled = true;
+            var awgChoice = awgSelect.value;
+            var awgPayload = awgChoice === 'off'
+              ? { enabled: false }
+              : Object.assign({}, awgDefaults, {
+                  enabled: true,
+                  mode: awgChoice === 'custom' ? 'custom' : 'warp-safe',
+                  cps: 'quic'
+                });
             api('/clients', {
               method: 'POST',
               body: {
                 name: nameInput.value,
                 count: Number(countInput.value) || 1,
                 format: formatSelect.value,
-                identityId: identitySelect.value || undefined
+                identityId: identitySelect.value || undefined,
+                awg: awgPayload
               }
             }).then(function (result) {
               closeModal();
@@ -352,6 +453,7 @@ export const CLIENT_SCRIPT = String.raw`
     wrap.appendChild(h('div', { class: 'grid' }, [
       statCard(t('statClients'), state.stats.clients || 0),
       statCard(t('statIdentities'), state.stats.identities || 0),
+      statCard(t('statProxies'), state.stats.proxies || 0),
       statCard(t('statPlus'), state.stats.plus || 0),
       statCard(t('statViews'), state.stats.views || 0)
     ]));
@@ -361,7 +463,8 @@ export const CLIENT_SCRIPT = String.raw`
         h('div', {}, [h('h2', { text: t('navDashboard') }), h('p', { class: 'muted', text: t('tagline') })]),
         h('div', { class: 'row' }, [
           h('button', { class: 'primary', text: t('newConfig'), onclick: createClientForm }),
-          h('button', { text: t('newIdentity'), onclick: registerIdentity }),
+          h('button', { text: t('newProxy'), onclick: createProxyForm }),
+          h('button', { class: 'ghost', text: t('newIdentity'), onclick: registerIdentity }),
           h('button', { class: 'ghost', text: t('importIdentity'), onclick: importForm })
         ])
       ])
@@ -436,7 +539,10 @@ export const CLIENT_SCRIPT = String.raw`
           h('span', { class: 'pill muted', text: identity ? identity.name : '—' })
         ]),
         h('td', { class: 'hide-sm mono tiny', text: identity && identity.addressV4 ? identity.addressV4 : '—' }),
-        h('td', { class: 'hide-sm', text: client.format }),
+        h('td', { class: 'hide-sm' }, [
+          h('span', { text: client.format }),
+          client.awg ? h('span', { class: 'pill ok', style: 'margin-inline-start:6px', text: 'AWG' }) : null
+        ]),
         h('td', {}, [h('div', { class: 'row' }, [
           h('button', { class: 'small', text: t('show'), onclick: function () { showConfig(client.id); } }),
           h('button', { class: 'small ghost', text: t('shareLink'), onclick: function () { copy(location.origin + '/c/' + client.shareToken, t('copied')); } }),
@@ -456,6 +562,74 @@ export const CLIENT_SCRIPT = String.raw`
           h('button', { class: 'small danger', text: t('remove'), onclick: function () {
             if (!confirm(t('confirmDelete'))) return;
             api('/clients/' + client.id, { method: 'DELETE' }).then(loadState).catch(function (err) { toast(err.message, 'error'); });
+          } })
+        ])])
+      ]));
+    });
+    table.appendChild(body);
+    wrap.appendChild(h('div', { class: 'card' }, [table]));
+    return wrap;
+  }
+
+  function viewProxies() {
+    var wrap = h('div', { class: 'stack' });
+    var info = state.proxy || {};
+    wrap.appendChild(h('div', { class: 'between' }, [
+      h('div', {}, [
+        h('h2', { text: t('navProxy') }),
+        h('p', { class: 'muted tiny', text: 'VLESS + WebSocket + TLS · ' + (info.host || '') + (info.path || '') })
+      ]),
+      h('div', { class: 'row' }, [
+        h('button', { class: 'primary', text: t('newProxy'), onclick: createProxyForm }),
+        h('button', { class: 'ghost', text: t('refresh'), onclick: loadState })
+      ])
+    ]));
+    wrap.appendChild(h('div', { class: 'banner', text: t('serviceHint') }));
+
+    if (!state.proxies.length) {
+      wrap.appendChild(h('div', { class: 'banner', text: t('noClients') }));
+      return wrap;
+    }
+
+    var table = h('table', { class: 'table' });
+    table.appendChild(h('thead', {}, [h('tr', {}, [
+      h('th', { text: t('clientName') }),
+      h('th', { class: 'hide-sm', text: t('proxyUuid') }),
+      h('th', { class: 'hide-sm', text: 'Host' }),
+      h('th', { text: t('actions') })
+    ])]));
+    var body = h('tbody');
+    state.proxies.forEach(function (proxy) {
+      body.appendChild(h('tr', {}, [
+        h('td', {}, [
+          h('div', { class: 'row' }, [
+            h('div', { style: 'font-weight:600', text: proxy.name }),
+            h('span', { class: 'pill ' + (proxy.enabled === false ? 'muted' : 'ok'),
+              text: proxy.enabled === false ? t('disabled') : t('enabled') })
+          ]),
+          h('div', { class: 'muted tiny', text: proxy.url ? proxy.url.split('@')[0].replace('vless://', 'vless://') : '' })
+        ]),
+        h('td', { class: 'hide-sm mono tiny', text: proxy.uuid || '—' }),
+        h('td', { class: 'hide-sm mono tiny', text: (proxy.host || '') + ':' + (proxy.port || 443) }),
+        h('td', {}, [h('div', { class: 'row' }, [
+          h('button', { class: 'small', text: t('showLink'), onclick: function () { showProxyModal(proxy); } }),
+          h('button', { class: 'small ghost', text: t('copy'), onclick: function () { copy(proxy.url || ''); } }),
+          h('button', { class: 'small ghost', text: t('rotate'), onclick: function () {
+            if (!confirm(t('confirmRotate'))) return;
+            api('/proxies/' + proxy.id + '/rotate', { method: 'POST' })
+              .then(function () { toast(t('success'), 'success'); return loadState(); })
+              .catch(function (err) { toast(err.message, 'error'); });
+          } }),
+          h('button', { class: 'small ghost', text: proxy.enabled === false ? t('enable') : t('disable'), onclick: function () {
+            var next = proxy.enabled === false;
+            if (!next && !confirm(t('confirmDisable'))) return;
+            api('/clients/' + proxy.id, { method: 'PATCH', body: { enabled: next } })
+              .then(function () { toast(t('success'), 'success'); return loadState(); })
+              .catch(function (err) { toast(err.message, 'error'); });
+          } }),
+          h('button', { class: 'small danger', text: t('remove'), onclick: function () {
+            if (!confirm(t('confirmDelete'))) return;
+            api('/clients/' + proxy.id, { method: 'DELETE' }).then(loadState).catch(function (err) { toast(err.message, 'error'); });
           } })
         ])])
       ]));
@@ -566,6 +740,31 @@ export const CLIENT_SCRIPT = String.raw`
       policySelect.appendChild(h('option', { value: pair[0], text: pair[1], selected: settings.identityPolicy === pair[0] }));
     });
 
+    var awg = settings.awg || {};
+    var awgToggle = h('select');
+    [['false', t('awgOff')], ['true', t('awgEnabled')]].forEach(function (pair) {
+      awgToggle.appendChild(h('option', { value: pair[0], text: pair[1], selected: String(Boolean(awg.enabled)) === pair[0] }));
+    });
+    var awgMode = h('select');
+    [['warp-safe', t('awgWarpSafe')], ['custom', t('awgCustom')]].forEach(function (pair) {
+      awgMode.appendChild(h('option', { value: pair[0], text: pair[1], selected: (awg.mode || 'warp-safe') === pair[0] }));
+    });
+    var awgCps = h('select');
+    ['quic', 'stun', 'dtls', 'dns', 'random', 'none'].forEach(function (kind) {
+      awgCps.appendChild(h('option', { value: kind, text: kind, selected: (awg.cps || 'quic') === kind }));
+    });
+    var awgJc = h('input', { type: 'number', min: '0', max: '12', value: String(awg.jc || 4) });
+    var awgJmin = h('input', { type: 'number', min: '0', max: '120', value: String(awg.jmin || 40) });
+    var awgJmax = h('input', { type: 'number', min: '0', max: '200', value: String(awg.jmax || 70) });
+
+    var proxyPath = h('input', { value: settings.proxyPath || '/ws', placeholder: '/ws' });
+    var proxyPort = h('input', { type: 'number', min: '1', max: '65535', value: String(settings.proxyPort || 443) });
+    var proxyDomain = h('input', { value: settings.proxyDomain || '', placeholder: 'warp.example.com' });
+    var proxyPadding = h('select');
+    [['false', 'خاموش'], ['true', 'روشن']].forEach(function (pair) {
+      proxyPadding.appendChild(h('option', { value: pair[0], text: pair[1], selected: String(Boolean(settings.proxyPadding)) === pair[0] }));
+    });
+
     var prefixInput = h('input', { value: settings.namePrefix || 'nova' });
     var limitInput = h('input', { type: 'number', min: '1', max: '60', value: String(settings.registrationLimitPerHour || 6) });
     var apiKeyInput = h('input', { value: state.apiKey || '', readonly: true, class: 'mono' });
@@ -597,6 +796,36 @@ export const CLIENT_SCRIPT = String.raw`
         h('div', {}, [h('label', { text: t('namePrefix') }), prefixInput]),
         h('div', {}, [h('label', { text: t('registrationLimit') }), limitInput])
       ]),
+      h('h3', { text: t('awgTitle') }),
+      h('div', { class: 'grid' }, [
+        h('div', {}, [h('label', { text: t('enabled') }), awgToggle]),
+        h('div', {}, [h('label', { text: t('awgPreset') }), awgMode]),
+        h('div', {}, [h('label', { text: t('awgCps') }), awgCps])
+      ]),
+      h('div', { class: 'grid' }, [
+        h('div', {}, [h('label', { text: 'Jc' }), awgJc]),
+        h('div', {}, [h('label', { text: 'Jmin' }), awgJmin]),
+        h('div', {}, [h('label', { text: 'Jmax' }), awgJmax]),
+        h('div', {}, [h('label', { text: ' ' }), h('button', {
+          class: 'small ghost',
+          text: t('awgReshuffle'),
+          onclick: function (event) {
+            api('/settings', { method: 'PUT', body: { awgRandomize: true } })
+              .then(function () { toast(t('success'), 'success'); return loadState(); })
+              .catch(function (err) { toast(err.message, 'error'); });
+            void event;
+          }
+        })])
+      ]),
+      h('p', { class: 'small-hint', text: t('awgHint') }),
+      h('h3', { text: t('proxySettings') }),
+      h('div', { class: 'grid' }, [
+        h('div', {}, [h('label', { text: t('proxyPathLabel') }), proxyPath]),
+        h('div', {}, [h('label', { text: t('proxyPortLabel') }), proxyPort]),
+        h('div', {}, [h('label', { text: t('proxyDomainLabel') }), proxyDomain]),
+        h('div', {}, [h('label', { text: t('proxyPaddingLabel') }), proxyPadding])
+      ]),
+      h('p', { class: 'small-hint', text: t('proxyPathHint') }),
       h('div', { class: 'row' }, [
         h('button', {
           class: 'primary',
@@ -621,7 +850,22 @@ export const CLIENT_SCRIPT = String.raw`
                 defaultFormat: formatSelect.value,
                 identityPolicy: policySelect.value,
                 namePrefix: prefixInput.value,
-                registrationLimitPerHour: Number(limitInput.value)
+                registrationLimitPerHour: Number(limitInput.value),
+                awg: {
+                  enabled: awgToggle.value === 'true',
+                  mode: awgMode.value,
+                  cps: awgCps.value,
+                  jc: Number(awgJc.value),
+                  jmin: Number(awgJmin.value),
+                  jmax: Number(awgJmax.value),
+                  s1: (awg.s1 || 0), s2: (awg.s2 || 0), s3: (awg.s3 || 0), s4: (awg.s4 || 0),
+                  h1: (awg.h1 || 1), h2: (awg.h2 || 2), h3: (awg.h3 || 3), h4: (awg.h4 || 4),
+                  i1: awg.i1, i2: awg.i2, i3: awg.i3, i4: awg.i4, i5: awg.i5
+                },
+                proxyPath: proxyPath.value,
+                proxyPort: Number(proxyPort.value),
+                proxyDomain: proxyDomain.value,
+                proxyPadding: proxyPadding.value === 'true' 
               }
             }).then(function () {
               toast(t('success'), 'success');
@@ -671,7 +915,7 @@ export const CLIENT_SCRIPT = String.raw`
   function render() {
     var host = document.getElementById('view');
     clear(host);
-    var views = { dashboard: viewDashboard, clients: viewClients, identities: viewIdentities, settings: viewSettings, help: viewHelp };
+    var views = { dashboard: viewDashboard, clients: viewClients, proxy: viewProxies, identities: viewIdentities, settings: viewSettings, help: viewHelp };
     host.appendChild((views[activeTab] || viewDashboard)());
     Array.prototype.forEach.call(document.querySelectorAll('.nav button'), function (button) {
       button.className = button.dataset.tab === activeTab ? 'active' : '';
@@ -708,6 +952,9 @@ export const CLIENT_SCRIPT = String.raw`
   if (logoutButton) logoutButton.addEventListener('click', function () {
     api('/logout', { method: 'POST' }).then(function () { location.href = '/login'; });
   });
+
+  var newProxyButton = document.getElementById('new-proxy');
+  if (newProxyButton) newProxyButton.addEventListener('click', createProxyForm);
 
   var newConfigButton = document.getElementById('new-config');
   if (newConfigButton) newConfigButton.addEventListener('click', createClientForm);

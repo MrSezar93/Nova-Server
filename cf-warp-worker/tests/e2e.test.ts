@@ -312,6 +312,128 @@ describe("worker end to end (mocked WARP API)", () => {
     assert.deepEqual(afterClear.logs, []);
   });
 
+  it("creates VLESS proxies and serves their links, subscription and share page", async () => {
+    const created = await call("POST", "/api/v1/proxies", { json: { name: "phone-proxy", count: 2 } });
+    assert.equal(created.status, 201);
+    const { proxies } = await readJson<{ proxies: Array<Record<string, unknown>> }>(created);
+    assert.equal(proxies.length, 2);
+    const proxy = proxies[0];
+    assert.equal(proxy.kind, "proxy");
+    assert.match(String(proxy.url), /^vless:\/\/[0-9a-f-]{36}@panel\.test:443\?/);
+    assert.match(String(proxy.url), /type=ws/);
+    assert.match(String(proxy.url), /security=tls/);
+    assert.match(String(proxy.url), /path=%2Fws/);
+    assert.match(String(proxy.url), /#phone-proxy-1$/);
+    assert.equal(proxy.enabled, true);
+
+    // panel state advertises the proxy settings
+    const state = await readJson<{
+      proxies: Array<Record<string, unknown>>;
+      proxy: Record<string, unknown>;
+      stats: Record<string, number>;
+    }>(await call("GET", "/api/v1/state"));
+    assert.equal(state.proxies.length, 2);
+    assert.equal(state.stats.proxies, 2);
+    assert.equal(state.proxy.path, "/ws");
+    assert.equal(state.proxy.host, "panel.test");
+
+    // links endpoint: clash / singbox / xray / raw
+    const clash = await call("GET", `/api/v1/proxies/${proxy.id}/links?format=clash`);
+    assert.equal(clash.status, 200);
+    const clashBody = await readJson<{ content: string }>(clash);
+    assert.match(clashBody.content, /type: vless/);
+    assert.match(clashBody.content, /network: ws/);
+
+    const raw = await call("GET", `/api/v1/proxies/${proxy.id}/links`);
+    assert.match((await readJson<{ content: string }>(raw)).content, /^vless:\/\//);
+
+    const singbox = JSON.parse(
+      (await readJson<{ content: string }>(await call("GET", `/api/v1/proxies/${proxy.id}/links?format=singbox`))).content,
+    ) as { outbounds: Array<Record<string, unknown>> };
+    assert.equal(singbox.outbounds[0].type, "vless");
+
+    // public share page, subscription and QR
+    const token = String(proxy.shareToken);
+    const share = await call("GET", `/c/${token}`, { cookie: "" });
+    assert.equal(share.status, 200);
+    const shareHtml = await share.text();
+    assert.match(shareHtml, /vless:\/\//);
+    assert.match(shareHtml, /VLESS \+ WS \+ TLS/);
+    assert.match(shareHtml, /\/sub\/|sub\//);
+
+    const sub = await call("GET", `/sub/${token}`, { cookie: "" });
+    assert.equal(sub.status, 200);
+    const decoded = Buffer.from((await sub.text()).trim(), "base64").toString("utf8");
+    assert.match(decoded, /^vless:\/\//);
+    assert.match(decoded, new RegExp(`#${proxy.name}$`, "m"));
+
+    const clashSub = await call("GET", `/sub/${token}?format=clash`, { cookie: "" });
+    assert.match(await clashSub.text(), /type: vless/);
+
+    const qr = await call("GET", `/qr/${token}.svg`, { cookie: "" });
+    assert.equal(qr.status, 200);
+    assert.match(qr.headers.get("content-type") ?? "", /image\/svg\+xml/);
+
+    const download = await call("GET", `/c/${token}/raw`, { cookie: "" });
+    assert.equal(download.headers.get("content-disposition"), 'attachment; filename="phone-proxy-1.txt"');
+
+    // disabling revokes the public link, rotating changes the UUID
+    const disabled = await call("PATCH", `/api/v1/clients/${proxy.id}`, { json: { enabled: false } });
+    assert.equal(disabled.status, 200);
+    assert.equal((await call("GET", `/c/${token}`, { cookie: "" })).status, 403);
+    assert.equal((await call("GET", `/sub/${token}`, { cookie: "" })).status, 403);
+    await call("PATCH", `/api/v1/clients/${proxy.id}`, { json: { enabled: true } });
+
+    const rotated = await readJson<{ proxy: Record<string, unknown> }>(
+      await call("POST", `/api/v1/proxies/${proxy.id}/rotate`),
+    );
+    assert.notEqual(rotated.proxy.uuid, proxy.uuid);
+
+    const removed = await call("DELETE", `/api/v1/clients/${proxy.id}`);
+    assert.equal(removed.status, 200);
+    assert.equal((await call("GET", `/c/${token}`, { cookie: "" })).status, 404);
+  });
+
+  it("configures AmneziaWG defaults and applies them to new profiles", async () => {
+    installWarpMock();
+    const updated = await call("PUT", "/api/v1/settings", {
+      json: {
+        awg: { enabled: true, mode: "warp-safe", cps: "stun", jc: 6, jmin: 44, jmax: 88 },
+        proxyPath: "api/stream/",
+        proxyDomain: "https://warp.example.com/",
+        proxyPort: 8443,
+        proxyPadding: true,
+      },
+    });
+    assert.equal(updated.status, 200);
+    const { settings } = await readJson<{ settings: Record<string, unknown> }>(updated);
+    const awg = settings.awg as Record<string, unknown>;
+    assert.equal(awg.enabled, true);
+    assert.equal(awg.jc, 6);
+    assert.deepEqual([awg.s1, awg.h1], [0, 1]);
+    assert.equal(settings.proxyPath, "/api/stream");
+    assert.equal(settings.proxyDomain, "warp.example.com");
+    assert.equal(settings.proxyPort, 8443);
+    assert.equal(settings.proxyPadding, true);
+
+    const created = await readJson<{ clients: Array<Record<string, unknown>> }>(
+      await call("POST", "/api/v1/clients", { json: { name: "awg-phone" } }),
+    );
+    const id = String(created.clients[0].id);
+    const conf = (await readConfig(await call("GET", `/api/v1/clients/${id}/config?format=amneziawg`))).content;
+    assert.match(conf, /Jc = 6/);
+    assert.match(conf, /I1 = <b 0x/);
+    assert.match(conf, /H1 = 1/);
+
+    // the proxy link now advertises the custom path/domain/port
+    const proxy = await readJson<{ proxies: Array<Record<string, unknown>> }>(
+      await call("POST", "/api/v1/proxies", { json: { name: "p2" } }),
+    );
+    const url = String(proxy.proxies[0].url);
+    assert.match(url, /@warp\.example\.com:8443\?/);
+    assert.match(url, /path=%2Fapi%2Fstream%3Fed%3D2048/);
+  });
+
   it("handles the setup gate, login throttling and logout", async () => {
     Store.clearCache();
     env = makeEnv();

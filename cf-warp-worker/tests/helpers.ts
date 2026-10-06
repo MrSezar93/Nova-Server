@@ -187,3 +187,141 @@ export function sessionCookieFrom(response: Response): string {
   if (!header) throw new Error("no set-cookie header");
   return header.split(";")[0];
 }
+
+/* -------------------------------------------------------------------------- */
+/*                    WebSocket / TCP socket test doubles                     */
+/* -------------------------------------------------------------------------- */
+
+/** Minimal stand-in for the runtime's `WebSocket` (server side of a pair). */
+export class FakeWebSocket {
+  readyState = 0;
+  /** Frames this socket sent (seen by the peer). */
+  sent: unknown[] = [];
+  /** Frames this socket received from the peer. */
+  received: unknown[] = [];
+  closeCode: number | undefined;
+  closeReason: string | undefined;
+  accepted = false;
+  peer: FakeWebSocket | null = null;
+  private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
+
+  accept(): void {
+    this.accepted = true;
+    this.readyState = 1;
+  }
+
+  addEventListener(type: string, listener: (event: unknown) => void): void {
+    const list = this.listeners.get(type) ?? [];
+    list.push(listener);
+    this.listeners.set(type, list);
+  }
+
+  private emit(type: string, event: unknown): void {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+
+  send(data: unknown): void {
+    this.sent.push(data);
+    if (this.peer) {
+      this.peer.received.push(data);
+      this.peer.emit("message", { data });
+    }
+  }
+
+  close(code = 1000, reason = ""): void {
+    this.closeCode = code;
+    this.closeReason = reason;
+    this.readyState = 3;
+    this.emit("close", { code, reason });
+    this.peer?.emit("close", { code, reason });
+  }
+
+  /** Test helper: pushes a frame coming from the client. */
+  deliver(data: unknown): void {
+    this.received.push(data);
+    this.emit("message", { data });
+  }
+}
+
+export function fakeSocketPair(): { client: FakeWebSocket; server: FakeWebSocket } {
+  const client = new FakeWebSocket();
+  const server = new FakeWebSocket();
+  client.peer = server;
+  server.peer = client;
+  server.accept();
+  return { client, server };
+}
+
+/** In-memory duplex socket returned by the fake `connect()`. */
+export class FakeSocket {
+  readonly toTarget: Uint8Array[] = [];
+  readonly readable: ReadableStream<Uint8Array>;
+  readonly writable: WritableStream<Uint8Array>;
+  readonly closed: Promise<void>;
+  readonly address: string;
+  closedFlag = false;
+  private controller!: ReadableStreamDefaultController<Uint8Array>;
+  private resolveClosed!: () => void;
+
+  constructor(address: string) {
+    this.address = address;
+    this.readable = new ReadableStream<Uint8Array>({
+      start: (controller) => {
+        this.controller = controller;
+      },
+    });
+    this.writable = new WritableStream<Uint8Array>({
+      write: (chunk) => {
+        this.toTarget.push(chunk);
+      },
+    });
+    this.closed = new Promise<void>((resolve) => {
+      this.resolveClosed = resolve;
+    });
+  }
+
+  /** Test helper: sends bytes back to the session ("upstream → client"). */
+  push(bytes: Uint8Array): void {
+    try {
+      this.controller.enqueue(bytes);
+    } catch {
+      /* stream closed */
+    }
+  }
+
+  close(): void {
+    this.closedFlag = true;
+    try {
+      this.controller.close();
+    } catch {
+      /* already closed */
+    }
+    this.resolveClosed();
+  }
+
+  /** Everything the session wrote, as one buffer. */
+  written(): Uint8Array {
+    return concatBytes(this.toTarget);
+  }
+}
+
+export function concatBytes(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+/** Waits until `check()` is true (or the timeout elapses). */
+export async function waitFor(check: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("waitFor timed out");
+}

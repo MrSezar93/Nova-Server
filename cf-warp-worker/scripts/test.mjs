@@ -36,7 +36,7 @@ for (const entry of entries) {
     format: "esm",
     platform: "node",
     target: "node20",
-    external: ["node:*"],
+    external: ["node:*", "cloudflare:*"],
     logLevel: "error",
     banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
   });

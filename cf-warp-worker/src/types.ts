@@ -1,5 +1,6 @@
 /** Shared types for the Nova WARP Worker. */
 
+import { AWG_WARP_SAFE, type AwgOptions } from "./lib/awg";
 import type { AllowedIpsMode, ConfigFormat, EndpointMode } from "./lib/wg";
 
 export interface Env {
@@ -27,6 +28,8 @@ export interface Env {
   DISABLE_RAW_TLS?: string;
   /** Optional default Zero Trust team token (JWT) applied to new registrations. */
   TEAM_TOKEN?: string;
+  /** "1" prints proxy-session errors to the Worker log (wrangler tail). */
+  PROXY_DEBUG?: string;
   /**
    * "1" removes `X-Frame-Options`/`frame-ancestors` so the panel can be embedded
    * in an iframe (used by the local preview harness; leave unset in production).
@@ -73,6 +76,8 @@ export interface Identity {
 }
 
 export interface ClientOptions {
+  /** AmneziaWG obfuscation (junk packets + fake protocol openings). */
+  awg?: AwgOptions;
   mtu?: number;
   dns?: string[];
   keepalive?: number;
@@ -84,9 +89,19 @@ export interface ClientOptions {
   includeIPv6?: boolean;
 }
 
+/**
+ * `warp` clients are WireGuard/WARP profiles rendered from an identity, `proxy`
+ * clients are VLESS-over-WebSocket endpoints served by this Worker itself.
+ */
+export type ClientKind = "warp" | "proxy";
+
 export interface ClientRecord {
   id: string;
   name: string;
+  kind?: ClientKind;
+  /** VLESS user id — only for `kind: "proxy"`. */
+  uuid?: string;
+  /** WARP identity — empty for proxy clients. */
   identityId: string;
   shareToken: string;
   enabled: boolean;
@@ -112,8 +127,18 @@ export interface PanelSettings {
   endpointPort?: number;
   includeIPv6: boolean;
   defaultFormat: ConfigFormat;
+  /** Default AmneziaWG settings applied to new WARP profiles. */
+  awg: AwgOptions;
   /** shared = every client uses the same WARP identity, pool = one identity per client. */
   identityPolicy: "shared" | "pool";
+  /** WebSocket path used by the built-in VLESS proxy, e.g. `/ws`. */
+  proxyPath: string;
+  /** TLS port advertised in proxy links (443 for *.workers.dev). */
+  proxyPort: number;
+  /** Optional custom domain advertised in proxy links instead of the request host. */
+  proxyDomain?: string;
+  /** Advertise Xray "early data" (`?ed=2048`) in generated proxy links. */
+  proxyPadding: boolean;
   sharedIdentityId?: string;
   namePrefix: string;
   registrationLimitPerHour: number;
@@ -157,7 +182,11 @@ export const DEFAULT_SETTINGS: PanelSettings = {
   endpointPort: 2408,
   includeIPv6: true,
   defaultFormat: "wg",
+  awg: { ...AWG_WARP_SAFE },
   identityPolicy: "pool",
+  proxyPath: "/ws",
+  proxyPort: 443,
+  proxyPadding: false,
   namePrefix: "nova",
   registrationLimitPerHour: 6,
   setupComplete: false,

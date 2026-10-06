@@ -110,6 +110,7 @@ export function renderPanelPage(options: {
   const tabs: Array<[string, string]> = [
     ["dashboard", dict.navDashboard],
     ["clients", dict.navClients],
+    ["proxy", dict.navProxy],
     ["identities", dict.navIdentities],
     ["settings", dict.navSettings],
     ["help", dict.navHelp],
@@ -125,6 +126,7 @@ export function renderPanelPage(options: {
     brandHeader({ title: options.panelTitle, lang, panelTitle: options.panelTitle }) +
     `<div class="nav" id="nav">${nav}<div style="flex:1"></div>` +
     `<button id="new-config" class="primary small">${escapeHtml(dict.newConfig)}</button>` +
+    `<button id="new-proxy" class="small">${escapeHtml(dict.newProxy)}</button>` +
     `<button id="logout" class="ghost small">${escapeHtml(dict.signOut)}</button>` +
     `</div>` +
     `<div id="kv-warning" class="banner warn" style="display:none">${escapeHtml(dict.kvMissing)}</div>` +
@@ -145,27 +147,37 @@ export function renderSharePage(options: {
   lang: Lang;
   client: ClientRecord;
   identity: Identity | null;
-  configs: Array<{ format: ConfigFormat; content: string }>;
+  configs: Array<{ format: ConfigFormat; content: string; label?: string; extension?: string; hint?: string }>;
   qrSvg?: string | null;
   qrError?: string;
+  /** Shown for proxy clients (VLESS over WebSocket). */
+  subscriptionUrl?: string;
+  /** Small badge in the header (e.g. "VLESS + WS + TLS"). */
+  kindBadge?: string;
 }): string {
   const lang = normalizeLang(options.lang);
   const dict = dictionary(lang);
+  const label = (entry: { format: ConfigFormat; label?: string }) =>
+    entry.label ?? FORMAT_LABELS[entry.format] ?? entry.format;
+  const extension = (entry: { format: ConfigFormat; extension?: string }) =>
+    entry.extension ?? (entry.format === "wg" || entry.format === "amneziawg" ? "conf" : entry.format === "clash" ? "yaml" : "json");
   const formatTabs = options.configs
     .map(
       (entry) =>
         `<a class="small" style="text-decoration:none" href="?format=${entry.format}#config">` +
-        `${escapeHtml(FORMAT_LABELS[entry.format])}</a>`,
+        `${escapeHtml(label(entry))}</a>`,
     )
-    .join(" ");
+    .join(" ") +
+    (options.subscriptionUrl ? ` <a class="small" style="text-decoration:none" href="${escapeHtml(options.subscriptionUrl)}">${escapeHtml(dict.subscription)}</a>` : "");
   const blocks = options.configs
     .map(
       (entry) =>
-        `<div class="stack" id="config"><h3>${escapeHtml(FORMAT_LABELS[entry.format])}</h3>` +
+        `<div class="stack" id="config"><h3>${escapeHtml(label(entry))}</h3>` +
+        (entry.hint ? `<p class="small-hint">${escapeHtml(entry.hint)}</p>` : "") +
         `<pre id="conf-${entry.format}">${escapeHtml(entry.content)}</pre>` +
         `<div class="row">` +
         `<button class="small" data-copy="${entry.format}">${escapeHtml(dict.copy)}</button>` +
-        `<button class="small ghost" data-download="${entry.format}">${escapeHtml(dict.download)}</button>` +
+        `<button class="small ghost" data-download="${entry.format}" data-ext="${extension(entry)}" data-name="${escapeHtml(entry.format)}">${escapeHtml(dict.download)}</button>` +
         `</div></div>`,
     )
     .join("");
@@ -177,9 +189,9 @@ export function renderSharePage(options: {
     `document.querySelectorAll('[data-copy]').forEach(function(b){b.addEventListener('click',function(){` +
     `navigator.clipboard.writeText(CFG[b.dataset.copy]);b.textContent='${dict.copied}';});});` +
     `document.querySelectorAll('[data-download]').forEach(function(b){b.addEventListener('click',function(){` +
-    `var f=b.dataset.download;var ext=f==='wg'?'conf':(f==='clash'?'yaml':'json');` +
+    `var f=b.dataset.download;var ext=b.dataset.ext||'txt';` +
     `var blob=new Blob([CFG[f]],{type:'text/plain;charset=utf-8'});var a=document.createElement('a');` +
-    `a.href=URL.createObjectURL(blob);a.download='warp-'+f+'.'+ext;document.body.appendChild(a);a.click();});});` +
+    `a.href=URL.createObjectURL(blob);a.download='warp-'+b.dataset.name+'.'+ext;document.body.appendChild(a);a.click();});});` +
     `</script>`;
   const body =
     `<div class="wrap">` +
@@ -189,6 +201,7 @@ export function renderSharePage(options: {
     `<div class="card stack">` +
     `<h1>${escapeHtml(dict.publicPage)}</h1>` +
     `<div class="row"><span class="pill">${escapeHtml(options.client.name)}</span>` +
+    (options.kindBadge ? `<span class="pill ok">${escapeHtml(options.kindBadge)}</span>` : "") +
     (options.identity?.addressV4
       ? `<span class="pill muted mono">${escapeHtml(options.identity.addressV4)}</span>`
       : "") +

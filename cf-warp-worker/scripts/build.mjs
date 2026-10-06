@@ -26,6 +26,8 @@ await build({
   target: "es2022",
   platform: "browser",
   conditions: ["worker", "browser", "import"],
+  // `cloudflare:sockets` is provided by the Workers runtime, never bundled.
+  external: ["cloudflare:*"],
   mainFields: ["module", "main"],
   minify: single,
   legalComments: single ? "none" : "inline",

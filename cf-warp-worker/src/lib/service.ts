@@ -15,6 +15,7 @@ import {
   WarpApi,
   WarpApiError,
 } from "./warp";
+import { AWG_WARP_SAFE, normalizeAwg, type AwgOptions } from "./awg";
 import {
   clientIdFromReserved,
   defaultAllowedIps,
@@ -25,7 +26,17 @@ import {
   type ConfigFormat,
   type WgProfile,
 } from "./wg";
-import type { ClientRecord, Env, Identity, PanelSettings } from "../types";
+import {
+  clashProxyList,
+  newUuid,
+  normalizeProxyPath,
+  proxyMeta,
+  singboxConfig as proxySingboxConfig,
+  vlessLink,
+  xrayConfig as proxyXrayConfig,
+  type ProxyEndpoint,
+} from "./proxy";
+import type { ClientKind, ClientRecord, Env, Identity, PanelSettings } from "../types";
 
 export function warpApiFor(env: Env, fetchImpl?: typeof fetch): WarpApi {
   return new WarpApi({
@@ -268,6 +279,7 @@ export async function bindLicense(
 /** Builds the WireGuard profile for a client, honouring client > panel defaults. */
 export function buildProfile(settings: PanelSettings, identity: Identity, client: ClientRecord): WgProfile {
   const options = client.options ?? {};
+  const awg = normalizeAwg(options.awg ?? settings.awg ?? AWG_WARP_SAFE, AWG_WARP_SAFE);
   const endpoint = resolveEndpoint({
     mode: options.endpointMode ?? settings.endpointMode,
     host: options.endpointHost ?? settings.endpointHost,
@@ -276,6 +288,7 @@ export function buildProfile(settings: PanelSettings, identity: Identity, client
   const allowedIpsMode = options.allowedIpsMode ?? settings.allowedIpsMode;
   const allowedIps = defaultAllowedIps(allowedIpsMode, options.allowedIps ?? settings.allowedIps);
   return {
+    awg,
     privateKey: identity.privateKey,
     addressV4: identity.addressV4 ?? "172.16.0.2",
     addressV6: identity.addressV6,
@@ -293,11 +306,41 @@ export function buildProfile(settings: PanelSettings, identity: Identity, client
 
 export function renderForClient(
   settings: PanelSettings,
-  identity: Identity,
+  identity: Identity | null,
   client: ClientRecord,
   format: ConfigFormat = client.format,
+  host?: string,
 ): string {
+  if (client.kind === "proxy") {
+    const endpoint = buildProxyEndpoint(settings, client, host);
+    const proxies = [endpoint];
+    if (format === "clash") return clashProxyList(proxies);
+    if (format === "singbox") return proxySingboxConfig(proxies);
+    if (format === "xray") return proxyXrayConfig(proxies);
+    if (format === "json") return JSON.stringify(proxyMeta(endpoint), null, 2) + "\n";
+    // WireGuard formats are meaningless for a VLESS proxy: hand back the link.
+    return vlessLink(endpoint);
+  }
+  if (!identity) throw new WarpApiError("not_found", "هویت این کانفیگ پیدا نشد.", 404);
   return renderConfig(format, buildProfile(settings, identity, client), client.name || "warp");
+}
+
+/** Public endpoint advertised for a proxy client (VLESS over WebSocket + TLS). */
+export function buildProxyEndpoint(
+  settings: PanelSettings,
+  client: ClientRecord,
+  host?: string,
+): ProxyEndpoint {
+  const fallbackHost = (host ?? "example.workers.dev").replace(/^https?:\/\//, "").split("/")[0];
+  const cleanHost = (settings.proxyDomain?.trim() || fallbackHost).replace(/:\d+$/, "");
+  return {
+    uuid: client.uuid ?? "",
+    host: cleanHost,
+    port: Number(settings.proxyPort) || 443,
+    path: normalizeProxyPath(settings.proxyPath),
+    name: client.name || "nova-proxy",
+    padding: Boolean(settings.proxyPadding),
+  };
 }
 
 export interface CreateClientInput {
@@ -307,6 +350,10 @@ export interface CreateClientInput {
   format?: ConfigFormat;
   options?: ClientRecord["options"];
   actor?: string;
+  /** `warp` (default) or `proxy` (VLESS over WebSocket served by this Worker). */
+  kind?: ClientKind;
+  /** Enable AmneziaWG obfuscation on newly created WARP profiles. */
+  awg?: AwgOptions;
 }
 
 export interface CreateClientResult {
@@ -329,10 +376,40 @@ export async function createClients(
   const settings = await store.getSettings();
   const count = Math.min(Math.max(input.count ?? 1, 1), 25);
   const baseName = input.name?.trim();
-  const format = input.format ?? settings.defaultFormat;
+  const kind: ClientKind = input.kind === "proxy" ? "proxy" : "warp";
+  const format = input.format ?? (kind === "proxy" ? "json" : settings.defaultFormat);
   const identities = await store.listIdentities();
   const created: ClientRecord[] = [];
   let identity: Identity | null = null;
+
+  if (kind === "proxy") {
+    for (let index = 0; index < count; index++) {
+      const client: ClientRecord = {
+        id: randomId(9),
+        name: count > 1 ? `${baseName || "proxy"}-${index + 1}` : baseName || `proxy-${randomId(3)}`,
+        kind: "proxy",
+        identityId: "",
+        uuid: newUuid(),
+        shareToken: randomId(18),
+        enabled: true,
+        format: "json",
+        options: {},
+        createdAt: Date.now(),
+        createdBy: input.actor,
+        views: 0,
+      };
+      await store.saveClient(client);
+      created.push(client);
+    }
+    await store.addLog({
+      level: "success",
+      message: `${created.length} پروکسی ساخته شد`,
+      details: created.map((client) => client.name).join(", "),
+      actor: input.actor,
+    });
+    // The caller only needs the identity for WARP clients.
+    return { clients: created, identity: null as unknown as Identity };
+  }
 
   if (input.identityId) {
     identity = identities.find((item) => item.id === input.identityId) ?? null;
@@ -358,11 +435,15 @@ export async function createClients(
     const client: ClientRecord = {
       id: randomId(9),
       name: count > 1 ? `${baseName || "client"}-${index + 1}` : baseName || identityName(settings.namePrefix),
+      kind: "warp",
       identityId: identity.id,
       shareToken: randomId(18),
       enabled: true,
       format,
-      options: input.options ?? {},
+      options: {
+        ...(input.options ?? {}),
+        ...(input.awg ? { awg: normalizeAwg(input.awg) } : {}),
+      },
       createdAt: Date.now(),
       createdBy: input.actor,
       views: 0,
@@ -388,6 +469,12 @@ export async function rotateClient(
   client: ClientRecord,
   fetchImpl?: typeof fetch,
 ): Promise<ClientRecord> {
+  if (client.kind === "proxy") {
+    client.uuid = newUuid();
+    await store.saveClient(client);
+    await store.addLog({ level: "info", message: `شناسه‌ی پروکسی «${client.name}» بازتولید شد.` });
+    return client;
+  }
   const settings = await store.getSettings();
   const previousIdentityId = client.identityId;
   const identity = await registerNewIdentity(env, store, { name: client.name }, fetchImpl);
@@ -399,6 +486,16 @@ export async function rotateClient(
   await store.saveClient(client);
   await store.addLog({ level: "info", message: `کلید کانفیگ «${client.name}» بازتولید شد.` });
   return client;
+}
+
+/** Shape of a proxy client returned by the panel API. */
+export function proxySummary(settings: PanelSettings, client: ClientRecord, host?: string) {
+  const endpoint = buildProxyEndpoint(settings, client, host);
+  const awg = normalizeAwg(client.options?.awg ?? settings.awg ?? AWG_WARP_SAFE, AWG_WARP_SAFE);
+  return {
+    ...proxyMeta(endpoint),
+    awg: awg.enabled ? awg : undefined,
+  };
 }
 
 export function identitySummary(identity: Identity) {

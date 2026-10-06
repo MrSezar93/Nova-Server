@@ -1,10 +1,17 @@
-# Nova WARP Worker — پنل و سرور کانفیگ WireGuard روی Cloudflare
+# Nova WARP Worker — WireGuard + AmneziaWG + پروکسی VLESS روی Cloudflare
 
-سرویس‌ورکر کلادفلر (Cloudflare Worker) که هویت‌های **WARP** کلادفلر را می‌سازد/مدیریت می‌کند و برای هر دستگاه یک **کانفیگ WireGuard** آماده‌ی استفاده می‌دهد؛ همراه با یک **پنل مدیریت فارسی** (داشبورد، کانفیگ‌ها، هویت‌ها، لینک اشتراک، QR و API).
 
-> 🧭 **معماری در یک نگاه:** ترافیک شما از شبکه‌ی کلادفلر (لبه‌ی WARP) عبور می‌کند و از دید سایت‌ها آی‌پی کلادفلر دیده می‌شود؛ Worker نقش **کنترل‌پلین** را دارد: ثبت‌نام/مدیریت هویت، ساخت کانفیگ، پنل و لینک اشتراک.
-> Worker نمی‌تواند خودش ترمینال WireGuard باشد، چون Cloudflare Workers سوکت **UDP** در اختیار کد نمی‌گذارد؛ ترمینالِ تونل، سرورهای WARP کلادفلر هستند (`162.159.192.0/24`، `188.114.96.0/24`، …) که از هر جای دنیا قابل دسترسی‌اند. مسیر داده: **دستگاه شما ← (WireGuard/UDP) ← لبه‌ی WARP کلادفلر ← اینترنت**.
+یک Cloudflare Worker که **سه سرویس کامل** را روی یک دامنه ارائه می‌دهد؛ همراه با یک **پنل مدیریت فارسی**:
 
+| سرویس | پروتکل | مسیر داده | مناسب برای |
+| --- | --- | --- | --- |
+| 🟦 **کانفیگ WireGuard/WARP** | WireGuard (UDP) | دستگاه ← لبه‌ی WARP کلادفلر ← اینترنت | اپ رسمی WireGuard، سرعت بالا، همه‌ی ترافیک دستگاه |
+| 🟪 **کانفیگ AmneziaWG** | AmneziaWG (UDP، ضد DPI) | همان مسیر، ولی با بسته‌های آشغال + بسته‌های جعلی (QUIC/STUN/DTLS/DNS) | شبکه‌هایی که WireGuard ساده را با DPI می‌بندند |
+| 🟩 **پروکسی VLESS روی خود Worker** | VLESS روی TLS + WebSocket | کلاینت ← TLS کلادفلر ← Worker ← مقصد (TCP) | عبور دادن ترافیک از کلادفلر **با TCP**، بدون هیچ سرور مجزا و بدون نیاز به تقویت WARP |
+
+> 🧭 **معماری در یک نگاه**
+> · تونل **WireGuard/AmneziaWG** روی سرورهای WARP کلادفلر تمام می‌شود (Worker نمی‌تواند خودش ترمینال WireGuard باشد، چون Workers سوکت **UDP** در اختیار کد نمی‌گذارد). مسیر داده: **دستگاه ← (WireGuard/UDP) ← لبه‌ی WARP ← اینترنت**. در این حالت Worker نقش **کنترل‌پلین** دارد: ثبت‌نام هویت، ساخت کانفیگ، پنل و لینک اشتراک.
+> · **پروکسی VLESS** روی خود Worker اجرا می‌شود: کلاینت یک تونل TLS+WebSocket به Worker می‌زند و Worker داده را با `connect()` به مقصد TCP می‌رساند. یعنی یک پروکسی واقعی TCP/TLS روی کلادفلر، بدون VPS، روی پورت ۴۴۳ و با خروجی از آی‌پی‌های کلادفلر.
 ---
 
 ## فهرست
@@ -15,13 +22,15 @@
 4. [تنظیمات و متغیرها](#تنظیمات-و-متغیرها)
 5. [اولین اجرا و کار با پنل](#اولین-اجرا-و-کار-با-پنل)
 6. [قالب‌های خروجی](#قالبهای-خروجی)
-7. [HTTP API](#http-api)
-8. [ورود هویت دستی (وقتی ثبت‌نام 429/403 می‌شود)](#ورود-هویت-دستی)
-9. [پیش‌نمایش محلی و تست](#پیشنمایش-محلی-و-تست)
-10. [امنیت](#امنیت)
-11. [عیب‌یابی](#عیبیابی)
-12. [سؤالات متداول](#سؤالات-متداول)
-13. [ساختار پروژه](#ساختار-پروژه)
+7. [پروکسی VLESS (روی خود Worker)](#پروکسی-vless-روی-خود-worker)
+8. [AmneziaWG (ضد DPI)](#amneziawg-ضد-dpi)
+9. [HTTP API](#http-api)
+10. [ورود هویت دستی (وقتی ثبت‌نام 429/403 می‌شود)](#ورود-هویت-دستی)
+11. [پیش‌نمایش محلی و تست](#پیشنمایش-محلی-و-تست)
+12. [امنیت](#امنیت)
+13. [عیب‌یابی](#عیبیابی)
+14. [سؤالات متداول](#سؤالات-متداول)
+15. [ساختار پروژه](#ساختار-پروژه)
 
 ---
 
@@ -33,9 +42,11 @@
 | مسیر پشتیبان TLS | اگر کلادفلر درخواست `fetch` را با ۴۲۹/۴۰۳ رد کند، همان درخواست روی سوکت خام TLS با اثر انگشت اندروید (`node:tls` + `nodejs_compat`) تکرار می‌شود |
 | ورود هویت دستی | ورود کانفیگ `.conf`، فایل `wgcf-account.toml`، خروجی JSON کلاینت WARP یا کلید خصوصی خام — بدون هیچ تماسی با API کلادفلر |
 | کانفیگ چندنفره | هر کانفیگ می‌تواند هویت اختصاصی خودش را داشته باشد (`pool`) یا همه روی یک هویت مشترک باشند (`shared`) |
-| قالب‌های خروجی | WireGuard `.conf`، sing-box، Clash.Meta، Xray/v2ray، JSON خام |
+| قالب‌های خروجی | WireGuard `.conf`، **AmneziaWG `.conf`**، sing-box، Clash.Meta، Xray/v2ray، JSON خام |
+| پروکسی VLESS | روی خود Worker (`/ws/<uuid>`)، پروتکل VLESS + WebSocket + TLS، بدون سرور مجزا، سازگار با v2rayNG / NekoBox / Hiddify / Streisand / Clash.Meta / Shadowrocket |
+| AmneziaWG | بسته‌های آشغال (`Jc/Jmin/Jmax`) + بسته‌های جعلی QUIC/STUN/DTLS/DNS (`I1..I4`) + حالت WARP-safe (سازگار با سرور کلادفلر) |
 | QR Code | تولید QR به‌صورت SVG بدون هیچ کتابخانه‌ی بیرونی (پیاده‌سازی کامل ۴۰ نسخه + ۴ سطح ECC) — برای اسکن با اپ WireGuard |
-| لینک اشتراک | `/c/<token>` (صفحه‌ی عمومی)، `/c/<token>/raw?format=` (دانلود)، `/qr/<token>.svg`، `/sub/<token>` (base64) |
+| لینک اشتراک | `/c/<token>` (صفحه‌ی عمومی)، `/c/<token>/raw?format=` (دانلود)، `/qr/<token>.svg`، `/sub/<token>` (base64؛ برای پروکسی: لینک `vless://` و خروجی Clash/sing-box) |
 | پنل فارسی | RTL، دارک/لایت، SPA سبک بدون CDN و بدون فونت بیرونی، مدیریت هویت/کانفیگ/تنظیمات/لاگ‌ها |
 | کنترل دسترسی | رمز پنل (PBKDF2-SHA256 در KV یا `PANEL_PASSWORD`)، کوکی امضاشده‌ی ۷ روزه با قابلیت باطل‌کردن، کلید API، محدودیت تلاش ورود، بررسی Same-Origin |
 | محدودیت ثبت‌نام | سهمیه‌ی قابل تنظیم (پیش‌فرض ۶ هویت در ساعت) برای جلوگیری از مسدودشدن توسط کلادفلر |
@@ -82,7 +93,7 @@ npm run deploy
 | `npm run typecheck` | بررسی تایپ‌ها (`tsc --noEmit`) |
 | `npm run build` | باندل خوانا → `dist/worker.js` |
 | `npm run build:single` | خروجی تک‌فایل و مینیفای‌شده → `dist/worker.min.js` |
-| `npm test` | اجرای ۵۵ تست (crypto، QR، API، پنل، مسیرهای اشتراک) |
+| `npm test` | اجرای ۸۱ تست (crypto، AWG، پروکسی VLESS، QR، API، پنل، مسیرهای اشتراک) |
 | `npm run preview` | پیش‌نمایش محلی پنل بدون Cloudflare (پورت ۸۰۸۰، رمز `nova-preview`) |
 | `npm run tail` | مشاهده‌ی زنده‌ی لاگ Worker |
 
@@ -144,6 +155,17 @@ npm run deploy
 | `identityPolicy` | `pool` \| `shared` | `pool` = هر کانفیگ هویت اختصاصی (توصیه‌شده)؛ `shared` = یک هویت برای همه. |
 | `namePrefix` | متن | پیشوند نام خودکار هویت‌ها (مثل `nova-a1b`). |
 | `registrationLimitPerHour` | ۱–۶۰ | سهمیه‌ی ساخت هویت. |
+| `awg.enabled` | bool | AmneziaWG برای کانفیگ‌های جدید: `Jc/Jmin/Jmax` + بسته‌های جعلی (`I1..I4`). |
+| `awg.mode` | `warp-safe` \| `custom` | `warp-safe` قالب را با سرور استاندارد کلادفلر سازگار نگه می‌دارد (`S=0`, `H=1,2,3,4`, `MTU=1280`). |
+| `awg.jc` / `awg.jmin` / `awg.jmax` | ۰–۱۲۸ | تعداد/اندازه‌ی بسته‌های آشغال پیش از handshake (پیش‌فرض ۴ / ۴۰ / ۷۰). |
+| `awg.s1..s4` | ۰–۶۴ | پدینگ پیام؛ برای WARP **باید ۰** باشد. |
+| `awg.h1..h4` | ۱–۲۱۴۷۴۸۳۶۴۷ | تایپ‌های هدر پیام؛ برای WARP **باید ۱،۲،۳،۴** باشد. |
+| `awg.cps` | `quic` \| `stun` \| `dtls` \| `dns` \| `random` \| `none` | نوع بسته‌ی جعلی که در `I1` فرستاده می‌شود (کاربر نهایی همان ترافیک را می‌بیند). |
+| `awg.i1..i5` | متن | عبارت دلخواه CPS (`<b 0x..>`, `<r n>`, `<rd n>`, `<rc n>`, `<t>`)؛ اگر خالی بماند از `cps` ساخته می‌شود. |
+| `proxyPath` | مسیر | مسیر WebSocket پروکسی (پیش‌فرض `/ws`)؛ لینک‌ها `/ws/<uuid>` می‌شوند. |
+| `proxyPort` | ۱–۶۵۵۳۵ | پورتی که در لینک پروکسی نوشته می‌شود (برای `*.workers.dev` همان ۴۴۳). |
+| `proxyDomain` | دامنه | اگر دامنه‌ی اختصاصی دارید، به‌جای میزبان درخواست در لینک‌ها نوشته می‌شود (`host:port`). |
+| `proxyPadding` | bool | افزودن `?ed=2048` (early data) به لینک‌های VLESS — برای Xray؛ در صورت پشتیبانی‌نکردن کلاینت، خاموش بگذارید. |
 
 ---
 
@@ -202,6 +224,93 @@ PersistentKeepalive = 25
 
 ---
 
+## پروکسی VLESS (روی خود Worker)
+
+این بخش، برخلاف WireGuard، **داده‌ی واقعی** را از خود Worker عبور می‌دهد. کلاینت یک تونل **VLESS روی TLS + WebSocket** به Worker می‌زند و Worker با `connect()` (`cloudflare:sockets`) داده را به مقصد TCP می‌رساند:
+
+```
+کلاینت  ──TLS(443) + WebSocket ──►  لبه‌ی کلادفلر  ──►  Worker  ──connect()──►  مقصد:port
+        (همان دامنه‌ی Worker)                    (این پروژه)          (TCP)
+```
+
+یعنی یک **پروکسی TCP/TLS کامل روی کلادفلر بدون هیچ VPS** — دامنه‌ی مشکوک نیست، گواهی معتبر دارد و پورت ۴۴۳ هم باز است.
+
+### ساخت پروکسی
+
+1. در پنل، تب **«پروکسی»** → **`+ پروکسی جدید`** (نام و تعداد). هر پروکسی یک **UUID** اختصاصی می‌گیرد.
+2. مسیر WebSocket و پورت در تب **تنظیمات** (`proxyPath` پیش‌فرض `/ws`، `proxyPort` پیش‌فرض `443`) تعیین می‌شود.
+3. برای هر پروکسی: **نمایش لینک**، **کپی**، **QR**، **چرخش UUID** (rotate — لینک قبلی از کار می‌افتد)، **غیرفعال/فعال** و **حذف**.
+4. قالب‌های خروجی همان مسیرهای عمومی هستند: `vless://`, `clash`, `singbox`, `xray`, `json`.
+
+### نمونه‌ی لینک
+
+```
+vless://<uuid>@<worker-host>:443?type=ws&security=tls&sni=<worker-host>&host=<worker-host>&path=%2Fws#phone-proxy
+```
+
+> اگر کلاینت شما h2/early-data می‌خواهد، در تنظیمات `proxyPadding` را روشن کنید تا `&ed=2048` به لینک اضافه شود.
+
+### چه کلاینت‌هایی کار می‌کنند؟
+
+| کلاینت | وضعیت |
+| --- | --- |
+| v2rayNG / v2rayN (Android/Windows) | ✅ لینک `vless://` را مستقیم import کنید |
+| NekoBox / Hiddify / Streisand / FoXray (iOS) | ✅ |
+| sing-box / Clash.Meta (Mihomo) / Xray-core | ✅ با `format=singbox` یا `format=clash` |
+| Shadowrocket / Stash | ✅ |
+
+پنل در تب پروکسی همین‌ها را آماده می‌دهد؛ `npm run preview` هم پیکربندی نمونه را نشان می‌دهد.
+
+### محدودیت‌های واقعی این پروکسی (مهم)
+
+- **UDP عبور نمی‌کند.** Cloudflare Workers فقط سوکت TCP می‌دهد؛ پس QUIC/UDP بازی‌ها و DNS-over-UDP از این مسیر رد نمی‌شوند. کلاینت‌ها خودشان QUIC را به TCP برمی‌گردانند (در v2ray/Clash تنظیم `"network": "tcp"` یا خاموش‌کردن QUIC کافی است).
+- **اتصال به مقصدهای مسدود:** `connect()` به **بازه‌های IP کلادفلر** و **پورت ۲۵** وصل نمی‌شود؛ همچنین هر سوکت باز در سقف اتصال‌های همزمان Worker حساب می‌شود (plans مختلف سقف متفاوت دارند).
+- **پروکسی برای خودِ Worker:** مسیر `/ws/<uuid>` فقط زمانی هندل می‌شود که هدر Upgrade داشته باشد؛ درخواست‌های معمولی مرورگر به همان مسیر، 404 می‌گیرند.
+- **مقصد را Worker باز می‌کند، نه کلاینت:** IP خروجی، IPهای کلادفلر است (نه IP شما) — برای دور زدن محدودیت‌های منطقه‌ای می‌تواند مناسب باشد، ولی یعنی ترافیک شما از لبه‌ی کلادفلر می‌گذرد.
+- **دیباگ:** با `PROXY_DEBUG=1` (متغیر محیطی) خطاهای سشن در `wrangler tail` چاپ می‌شوند.
+
+---
+
+## AmneziaWG (ضد DPI)
+
+**AmneziaWG** یک فورک از WireGuard است که handshake را از دید DPI نامرئی می‌کند: چند بسته‌ی آشغال (`Jc/Jmin/Jmax`) و یک بسته‌ی «جعل هویت» (`I1..I5`) که ظاهرش مثل QUIC/STUN/DTLS/DNS است، قبل از ترافیک واقعی فرستاده می‌شود. خیلی از شبکه‌ها که WireGuard ساده را می‌بندند، اجازه‌ی عبور این ترافیک را می‌دهند.
+
+### فعال‌سازی
+
+1. تب **تنظیمات** → بخش **AmneziaWG** → `awg.enabled = true` و `awg.mode = warp-safe` (پیشنهادشده).
+2. در ساخت کانفیگ جدید، قالب را `amneziawg` انتخاب کنید (یا در تنظیمات به‌عنوان قالب پیش‌فرض بگذارید). اگر هویت/کانفیگ تنظیمات AWG نداشته باشد، مقدار **WARP-safe** خودکار اعمال می‌شود.
+3. برای شخصی‌سازی بسته‌ی جعلی، `awg.cps` را عوض کنید: `quic`, `stun`, `dtls`, `dns`, `random`, `none` — یا عبارت دقیق را در `awg.i1` بنویسید.
+
+نمونه‌ی خروجی (بخش Interface):
+
+```ini
+[Interface]
+PrivateKey = <کلید>
+Address = 172.16.0.168/32, 2606:4700:110:8a4a::1/128
+DNS = 1.1.1.1, 1.0.0.1
+MTU = 1280
+Jc = 4
+Jmin = 40
+Jmax = 70
+H1 = 1
+H2 = 2
+H3 = 3
+H4 = 4
+I1 = <b 0xc300000001080d30e66…>   # بسته‌ی جعلی QUIC
+I2 = <rc 82>
+I3 = <rd 81>
+I4 = <r 79>
+```
+
+### نکات مهم سازگاری
+
+- **سمت سرور باید AWG باشد:** این کانفیگ‌ها روی سرور WARP کلادفلر کار می‌کنند (کلاینت AWG به سرور ساده وصل می‌شود؛ تگ‌های AWG فقط لایه‌ی ابزار روی wire هستند)، ولی اگر تنظیمات را به حالت `custom` ببرید (مثلاً `S1>0` یا `H1=0x1234`)، فقط سرور **AmneziaWG** (سرور خودتان یا AmneziaWG-WARP سازگار) آن‌ها را می‌فهمد.
+- **`mode = warp-safe` تضمین می‌کند** `S1..S4 = 0` و `H1..H4 = 1,2,3,4` و `MTU = 1280` بمانند؛ این‌ها شرط اتصال به سرور استاندارد کلادفلر هستند.
+- کلاینت مورد نیاز: **AmneziaVPN** (اندروید/iOS/دسکتاپ)، `awg`/`amneziawg-tools` (لینوکس/روتر)، **FLClash**، **Hiddify** (نسخه‌های جدید) یا هر کلاینتی که `Jc/Jmin/Jmax/I1..` را بفهمد. اپ رسمی WireGuard این فیلدها را نمی‌فهمد و کانفیگ را نمی‌پذیرد — برای همان اپ، قالب `wg` یا `singbox` را استفاده کنید (قالب `singbox`/`clash`/`xray` هم فیلدهای AWG را در بلوک `amnezia-wg-option` می‌نویسد).
+- برای AmneziaWG + پروکسی VLESS با هم: کانفیگ AWG را برای ترافیک کل دستگاه و پروکسی را برای اپ‌های خاص استفاده کنید (یا پروکسی را داخل AmneziaVPN به‌عنوان «AmneziaWG over VLESS» اضافه کنید — دو راه مستقل‌اند).
+
+---
+
 ## HTTP API
 
 همه‌ی مسیرهای `/api/v1/*` با **کوکی نشست** یا هدر `Authorization: Bearer <API_KEY>` کار می‌کنند. برای درخواست‌های تغییردهنده، هدر `Origin` باید با میزبان یکی باشد.
@@ -232,7 +341,26 @@ curl -s -H "Authorization: Bearer $KEY" "$BASE/api/v1/clients/<id>/config?format
 # ثبت لایسنس WARP+
 curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
      -d '{"license":"XXXXXXXX-XXXXXXXX-XXXXXXXX"}' $BASE/api/v1/identities/<id>/license
+
+# ساخت پروکسی VLESS و گرفتن لینک
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+     -d '{"name":"phone-proxy","count":1}' $BASE/api/v1/proxies
+curl -s -H "Authorization: Bearer $KEY" "$BASE/api/v1/proxies/<id>/links?format=vless"
+curl -s -H "Authorization: Bearer $KEY" "$BASE/api/v1/proxies/<id>/links?format=clash"
+
+# ساخت کانفیگ AmneziaWG (WARP-safe) و گرفتن فایل .conf
+curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+     -d '{"name":"awg-phone","format":"amneziawg","options":{"awg":{"enabled":true,"mode":"warp-safe","cps":"quic"}}}' \
+     $BASE/api/v1/clients
+curl -s -H "Authorization: Bearer $KEY" "$BASE/api/v1/clients/<id>/config?format=amneziawg"
 ```
+
+| متد و مسیر | کار |
+| --- | --- |
+| `GET /api/v1/proxies` | فهرست پروکسی‌ها + میزبان/پورت/مسیر + لینک آماده (`{proxies:[…]}`). |
+| `POST /api/v1/proxies` | ساخت پروکسی (`name`, `count` ۱–۲۵) → `201` با UUID جدید. |
+| `GET /api/v1/proxies/:id/links?format=` | محتوا: `vless` (پیش‌فرض)، `clash`, `singbox`, `xray`, `json` → `{format, content, proxy}`. |
+| `POST /api/v1/proxies/:id/rotate` | چرخش UUID (لینک قبلی باطل می‌شود). |
 
 | متد و مسیر | کار |
 | --- | --- |
@@ -251,7 +379,7 @@ curl -s -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/js
 | `GET /api/v1/clients/:id/config?format=` | محتوای کانفیگ (`{format, content}`). |
 | `PATCH /api/v1/clients/:id` | تغییر نام/قالب/هویت/`enabled`/`note`/`options`. |
 | `POST /api/v1/clients/:id/rotate` | بازتولید کلید و هویت کانفیگ. |
-| `DELETE /api/v1/clients/:id` | حذف کانفیگ. |
+| `DELETE /api/v1/clients/:id` | حذف کانفیگ (پروکسی‌ها هم همین مسیر را دارند: `PATCH`/`DELETE /api/v1/clients/:id`). |
 | `DELETE /api/v1/logs` | پاک‌کردن لاگ‌ها. |
 
 خطاها به شکل `{"error":"<کد>","message":"<پیام فارسی>","detail":"..."}` برمی‌گردند.
@@ -286,10 +414,10 @@ npm install
 npm run preview        # http://localhost:8080  — رمز: nova-preview
 ```
 
-پیش‌نمایش با `DEMO_MODE=1` اجرا می‌شود: یک هویت آزمایشی و دو کانفیگ نمونه ساخته می‌شود تا پنل، QR، صفحه‌ی اشتراک و API را بدون تماس با کلادفلر ببینید. (کانفیگ‌های DEMO واقعی نیستند.)
+پیش‌نمایش با `DEMO_MODE=1` اجرا می‌شود: یک هویت آزمایشی، دو کانفیگ نمونه (یکی AmneziaWG) و یک پروکسی VLESS ساخته می‌شود تا پنل، QR، صفحه‌ی اشتراک و API را بدون تماس با کلادفلر ببینید. (کانفیگ‌های DEMO واقعی نیستند و تونل VLESS در محیط پیش‌نمایش محلی — که WebSocket ندارد — `501` می‌دهد.)
 
 ```bash
-npm test               # ۵۵ تست بدون شبکه
+npm test               # ۸۱ تست بدون شبکه
 npm run typecheck      # بررسی تایپ‌ها
 npm run build:single   # خروجی تک‌فایل برای داشبورد
 ```
@@ -300,6 +428,9 @@ npm run build:single   # خروجی تک‌فایل برای داشبورد
 
 ## امنیت
 
+- **هر پروکسی یک UUID اختصاصی دارد**؛ کسی که لینک را داشته باشد می‌تواند از آن استفاده کند. پروکسی را «غیرفعال» یا «حذف/rotate» کنید تا لینک‌ها بی‌اثر شوند (هم `vless://` و هم `/c/`, `/sub/`, `/qr/` → `403`/`404`).
+- مسیر WebSocket توسط **پنل** (کوکی/API) ساخته می‌شود، ولی UUID حساس مثل رمز است — آن را عمومی منتشر نکنید.
+- Worker فقط با `connect()` به مقصد وصل می‌شود؛ هیچ پورتی روی Worker باز نمی‌شود و IP سرور محلی شما هرگز افشا نمی‌شود.
 - **رمز پنل**: اگر `PANEL_PASSWORD` را Secret بگذارید، مقایسه با HMAC زمان‌ثابت انجام می‌شود و هیچ هش رمزی در KV ذخیره نمی‌شود. در غیر این‌صورت، `PBKDF2-SHA256` با ۱۰٬۰۰۰ دور (قابل تغییر با `PASSWORD_ITERATIONS`) در KV ذخیره می‌شود.
 - **نشست‌ها**: کوکی `nova_warp_session` امضاشده با HMAC-SHA256، `HttpOnly` + `Secure` + `SameSite=Lax`، عمر ۷ روز. `POST /api/v1/logout` یک «دور نشست» را در KV بالا می‌برد، پس کوکی‌های قبلی (حتی اگر دزدیده شده باشند) بی‌اعتبار می‌شوند.
 - **ضد CSRF**: هر درخواست تغییردهنده باید `Origin`/`Sec-Fetch-Site` هم‌مبدأ داشته باشد.
@@ -323,19 +454,39 @@ npm run build:single   # خروجی تک‌فایل برای داشبورد
 | QR ساخته نمی‌شود | کانفیگ بزرگ‌تر از ظرفیت ۴۰ نسخه‌ی QR | فایل را دانلود کنید یا `includeIPv6` و DNS را کم کنید. |
 | «این لینک معتبر نیست» | کانفیگ حذف یا غیرفعال شده | در پنل، وضعیت کانفیگ را ببینید. |
 | `too many attempts` هنگام ورود | throttle ورود | ۱۰ دقیقه صبر کنید یا IP دیگری امتحان کنید. |
+| پروکسی VLESS وصل نمی‌شود | مسیر یا پورت اشتباه در لینک | در پنل تب پروکسی لینک را دوباره کپی کنید؛ اگر دامنه‌ی اختصاصی دارید `proxyDomain`/`proxyPort` و اگر Worker روی `workers.dev` است پورت باید ۴۴۳ باشد. |
+| کانفیگ AWG در کلاینت باز نمی‌شود | کلاینت فیلدهای AWG را نمی‌فهمد | از AmneziaVPN / FLClash / Hiddify / awg استفاده کنید؛ برای اپ رسمی WireGuard قالب `wg` را بگیرید. |
+| در AWG `mode = custom` اتصال قطع می‌شود | سرور WARP استاندارد `S≠0`/`H≠1,2,3,4` را رد می‌کند | `mode = warp-safe` را بگذارید یا این تنظیمات را برای سرور AmneziaWG خودتان نگه دارید. |
+| سایت‌هایی مثل خود کلادفلر از پروکسی باز نمی‌شوند | `connect()` به بازه‌های IP کلادفلر وصل نمی‌شود | محدودیت ذاتی Workers؛ از تونل WireGuard استفاده کنید. |
+| بازی/تماس تصویری از پروکسی کار نمی‌کند | پروکسی فقط TCP است و UDP عبور نمی‌کند | QUIC را در کلاینت به TCP محدود کنید یا از WARP برای آن اپ استفاده کنید. |
 
 ---
 
 ## سؤالات متداول
 
+**کدام‌یک را انتخاب کنم: WireGuard، AmneziaWG یا پروکسی VLESS؟**
+
+| شرایط شما | پیشنهاد |
+| --- | --- |
+| اپ رسمی WireGuard، شبکه بدون DPI، سرعت و UDP مهم است | **کانفیگ `wg`** |
+| شبکه WireGuard ساده را با DPI می‌بندد (ایران/چین/شبکه‌ی اداری) | **کانفیگ `amneziawg`** با `mode=warp-safe` |
+| فقط مرورگر/برخی اپ‌ها را می‌خواهید از کلادفلر رد کنید، یا کلاینت شما WireGuard ندارد | **پروکسی VLESS** (لینک `vless://`) |
+| هر دو را با هم می‌خواهید | کانفیگ AWG برای کل دستگاه + پروکسی برای اپ‌های خاص (یا برعکس)، هر کدام UUID/توکن جدا |
+
 **آیا ترافیک من واقعاً از کلادفلر عبور می‌کند؟**
 بله. دستگاه شما با پروتکل WireGuard به لبه‌ی WARP (شبکه‌ی کلادفلر) تونل می‌زند و خروجی ترافیک از آنجا است. Worker فقط کانفیگ/هویت را تحویل می‌دهد.
+
+**پروکسی VLESS داده را از کجا عبور می‌دهد؟**
+از خود Worker: TLS تا لبه‌ی کلادفلر، بعد WebSocket به Worker، و از آنجا `connect()` به مقصد TCP. یعنی خروجی هم روی شبکه‌ی کلادفلر است، ولی برخلاف WireGuard، مصرف CPU/درخواست Worker هم دارد و UDP عبور نمی‌کند.
 
 **چرا Worker خودش تونل WireGuard را بالا نمی‌آورد؟**
 چون Workers اجازه‌ی سوکت UDP نمی‌دهد و WireGuard روی UDP کار می‌کند. تنها راه اجرای واقعی WireGuard در Cloudflare، استفاده از سرورهای WARP آن است — همان کاری که این پروژه انجام می‌دهد.
 
-**تفاوت این با یک Worker پروکسی (VLESS/WS و …) چیست؟**
-آنجا ترافیک با TCP/TLS از خود Worker عبور می‌کند (محدودیت‌های خودش را دارد). اینجا یک تونل WireGuard کامل دارید: بدون CPU Worker مصرف نمی‌شود، سرعت بالاتر و پشتیبانی از UDP؛ فقط کانفیگ از Worker گرفته می‌شود.
+**تفاوت پروکسی VLESS این پروژه با یک Worker پروکسی آماده چیست؟**
+هیچ — همان معماری است (VLESS + WebSocket + TLS روی `connect()`)، ولی اینجا با پنل فارسی، UUID اختصاصی برای هر دستگاه، چرخش UUID، لینک `vless://`/Clash/sing-box/Xray و QR آماده، و بدون نیاز به سرور: لینک را از پنل بگیرید و داخل v2rayNG/Hiddify/NekoBox بچسبانید.
+
+**چرا Worker خودش تونل WireGuard را بالا نمی‌آورد؟**
+چون Workers اجازه‌ی سوکت UDP نمی‌دهد و WireGuard روی UDP کار می‌کند. تنها راه اجرای واقعی WireGuard در Cloudflare، استفاده از سرورهای WARP آن است — همان کاری که این پروژه انجام می‌دهد.
 
 **هر دستگاه هویت جدا بگیرد یا مشترک؟**
 جدا (`pool`). با هویت مشترک، کلادفلر ممکن است مسیر برگشت را بین دستگاه‌ها جابه‌جا کند و هر دو ناپایدار شوند.
@@ -356,10 +507,12 @@ npm run build:single   # خروجی تک‌فایل برای داشبورد
 ```
 cf-warp-worker/
 ├─ src/
-│  ├─ index.ts              روتر Worker و API  (/, /login, /setup, /api/v1/*, /c/:token, /qr/:token, /sub/:token, /healthz)
+│  ├─ index.ts              روتر Worker و API  (/, /login, /setup, /api/v1/*, /c/:token, /qr/:token, /sub/:token, /healthz, /ws/<uuid>)
 │  ├─ types.ts              تایپ‌ها + DEFAULT_SETTINGS
 │  ├─ lib/
-│  │  ├─ wg.ts              کلید X25519، reserved، انتخاب endpoint، رندر ۵ قالب کانفیگ
+│  │  ├─ wg.ts              کلید X25519، reserved، انتخاب endpoint، رندر ۶ قالب کانفیگ (شامل amneziawg)
+│  │  ├─ awg.ts             AmneziaWG: نرمال‌سازی/clamp، بسته‌های آشغال و بسته‌های جعلی CPS (QUIC/STUN/DTLS/DNS)
+│  │  ├─ proxy.ts           VLESS روی WebSocket: پارس هدر، لاگ اشتراک، پل TCP با connect()
 │  │  ├─ warp.ts            کلاینت API کلادفلر (ثبت‌نام/گرفتن/لایسنس/…) + مسیر پشتیبان TLS
 │  │  ├─ rawhttp.ts         درخواست HTTP روی سوکت خام TLS و پارسر chunked/content-length
 │  │  ├─ importer.ts        تشخیص و ورود conf / TOML / JSON / کلید خام
@@ -371,7 +524,7 @@ cf-warp-worker/
 │  │  └─ b64.ts             base64/base64url/hex، HMAC، SHA-256، مقایسه‌ی زمان‌ثابت
 │  └─ ui/                   پنل فارسی: i18n، تم، اسکریپت SPA و قالب صفحه‌ها
 ├─ scripts/                 build (esbuild) / test / preview محلی
-├─ tests/                   ۵۵ تست (node:test) شامل سوئیت end-to-end
+├─ tests/                   ۸۱ تست (node:test): wg / importer / auth / store / warp / awg / proxy / rawhttp / qr + سوئیت end-to-end
 ├─ wrangler.toml
 ├─ README.fa.md             همین فایل
 ├─ DEPLOY.fa.md             راهنمای گام‌به‌گام نصب

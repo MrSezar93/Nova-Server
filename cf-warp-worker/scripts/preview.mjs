@@ -35,7 +35,7 @@ await build({
   format: "esm",
   platform: "node",
   target: "node20",
-  external: ["node:*"],
+  external: ["node:*", "cloudflare:*"],
   logLevel: "error",
   banner: { js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);" },
 });
@@ -129,12 +129,20 @@ async function seed() {
   ).json();
   const identityId = identity?.identity?.id;
   for (const [name, format] of [
-    ["phone", "wg"],
+    ["phone", "amneziawg"],
     ["laptop", "singbox"],
   ]) {
-    await call("POST", "/api/v1/clients", { name, format, identityId }, cookie);
+    await call("POST", "/api/v1/clients", { name, format, identityId, awg: { enabled: true, mode: "warp-safe", cps: "quic" } }, cookie);
   }
-  console.log("✔ داده‌ی نمونه ساخته شد: ۱ هویت آزمایشی + ۲ کانفیگ (phone، laptop)");
+  const proxy = await call("POST", "/api/v1/proxies", { name: "phone-proxy", count: 1 }, cookie).then((r) => r.json());
+  await call(
+    "PUT",
+    "/api/v1/settings",
+    { proxyDomain: `preview.local:${port}`, proxyPath: "/ws" },
+    cookie,
+  );
+  console.log("✔ داده‌ی نمونه ساخته شد: ۱ هویت آزمایشی + ۲ کانفیگ WARP (با AmneziaWG) + ۱ پروکسی");
+  console.log("   لینک نمونه‌ی پروکسی: " + (proxy?.proxies?.[0]?.url ?? "-"));
 }
 
 await seed();

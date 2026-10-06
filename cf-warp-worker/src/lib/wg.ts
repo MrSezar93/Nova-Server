@@ -5,6 +5,7 @@
  *  - config rendering for WireGuard, sing-box, Clash, Xray and raw JSON
  */
 
+import { AWG_WARP_SAFE, awgLines, awgMihomoOption, isWarpSafe, type AwgOptions } from "./awg";
 import { base64ToBytes, bytesToBase64, pickRandom } from "./b64";
 
 const PKCS8_X25519_PREFIX = new Uint8Array([
@@ -140,6 +141,8 @@ export function resolveEndpoint(pref: EndpointPreference): WgEndpoint {
 /* -------------------------------------------------------------------------- */
 
 export interface WgProfile {
+  /** AmneziaWG obfuscation parameters (optional). */
+  awg?: AwgOptions;
   privateKey: string;
   addressV4: string;
   addressV6?: string;
@@ -156,12 +159,13 @@ export interface WgProfile {
   includeIPv6?: boolean;
 }
 
-export type ConfigFormat = "wg" | "singbox" | "clash" | "xray" | "json";
+export type ConfigFormat = "wg" | "amneziawg" | "singbox" | "clash" | "xray" | "json";
 
-export const CONFIG_FORMATS: readonly ConfigFormat[] = ["wg", "singbox", "clash", "xray", "json"];
+export const CONFIG_FORMATS: readonly ConfigFormat[] = ["wg", "amneziawg", "singbox", "clash", "xray", "json"];
 
 export const FORMAT_LABELS: Record<ConfigFormat, string> = {
   wg: "WireGuard (.conf)",
+  amneziawg: "AmneziaWG (.conf)",
   singbox: "sing-box (JSON)",
   clash: "Clash.Meta (YAML)",
   xray: "Xray / v2ray (JSON)",
@@ -176,10 +180,16 @@ function cleanAddress(value: string): string {
   return value.split("/")[0].trim();
 }
 
-export function wireGuardConf(profile: WgProfile): string {
+export function wireGuardConf(profile: WgProfile, options: { forceAwg?: boolean } = {}): string {
   const lines: string[] = [];
   lines.push("# Nova WARP — Cloudflare WireGuard profile");
   if (profile.label) lines.push(`# ${profile.label}`);
+  const awg = profile.awg;
+  if (awg?.enabled) {
+    if (options.forceAwg) lines.push("# AmneziaWG profile — import into an AmneziaWG client (AmneziaVPN, awg, FLClash, …)");
+    else if (isWarpSafe(awg)) lines.push("# AmneziaWG obfuscation enabled (WARP-safe: works in both WireGuard and AmneziaWG clients)");
+    else lines.push("# AmneziaWG obfuscation enabled (custom mode: requires a matching AmneziaWG server)");
+  }
   lines.push("[Interface]");
   lines.push(`PrivateKey = ${profile.privateKey}`);
   const v4 = `${cleanAddress(profile.addressV4)}/32`;
@@ -191,6 +201,7 @@ export function wireGuardConf(profile: WgProfile): string {
     if (dns.length) lines.push(`DNS = ${dns.join(", ")}`);
   }
   lines.push(`MTU = ${profile.mtu}`);
+  if (awg?.enabled) lines.push(...awgLines(awg));
   lines.push("");
   lines.push("[Peer]");
   lines.push(`PublicKey = ${profile.peerPublicKey}`);
@@ -221,6 +232,7 @@ export function singBoxConfig(profile: WgProfile, tag = "warp"): string {
 }
 
 export function clashConfig(profile: WgProfile, name = "warp"): string {
+  const amnezia = awgMihomoOption(profile.awg ?? ({ enabled: false } as AwgOptions));
   const lines = [
     "proxies:",
     `  - name: "${name}"`,
@@ -237,6 +249,13 @@ export function clashConfig(profile: WgProfile, name = "warp"): string {
     "    udp: true",
     `    dns: [${profile.dns.map((v) => `'${v}'`).join(", ")}]`,
   ];
+  if (amnezia) {
+    lines.push("    amnezia-wg-option:");
+    for (const [key, value] of Object.entries(amnezia)) {
+      lines.push(`      ${key}: ${typeof value === "number" ? value : `"${value}"`}`);
+    }
+    lines.push("      # در بعضی نسخه‌های Mihomo/Clash مقدار i1 باید base64 باشد؛ در آن صورت از خروجی .conf استفاده کنید.");
+  }
   return lines.join("\n") + "\n";
 }
 
@@ -290,6 +309,12 @@ export function jsonMeta(profile: WgProfile): string {
 
 export function renderConfig(format: ConfigFormat, profile: WgProfile, name = "warp"): string {
   switch (format) {
+    case "amneziawg": {
+      // The dedicated format always renders the obfuscation fields, falling back
+      // to the WARP-safe defaults when the client has no custom parameters.
+      const awg = profile.awg?.enabled ? profile.awg : { ...AWG_WARP_SAFE, enabled: true };
+      return wireGuardConf({ ...profile, awg }, { forceAwg: true });
+    }
     case "singbox":
       return singBoxConfig(profile, name);
     case "clash":
