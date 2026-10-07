@@ -4,7 +4,18 @@
 # ============================================================================
 
 name = "nova-warp"
+
+# نقطه‌ی ورود، فایل منبع TypeScript است — نه فایل اجرایی جاوااسکریپت.
+# خود wrangler هنگام `wrangler dev` و `wrangler deploy` آن را با esbuild
+# کامپایل و باندل می‌کند و نسخه‌ی جاوااسکریپت را به کلادفلر می‌فرستد؛ پس
+# نیازی به build دستی نیست. (برای دیدن خروجی جاوااسکریپت:
+#   npx wrangler deploy --dry-run --outdir /tmp/dry-run   →  /tmp/dry-run/index.js
+# و برای فایل تک‌قسمتی قابل‌پیست در داشبورد:  npm run build:single
+#   →  dist/worker.min.js که یک فایل جاوااسکریپت کامل است.)
+# اگر ترجیح می‌دهید main به یک فایل .js اشاره کند، خط زیر را جایگزین کنید:
+#   main = "dist/worker.js"        # اول: npm run build
 main = "src/index.ts"
+
 compatibility_date = "2025-08-01"
 
 # node:tls برای هندشیک TLS شبیه‌ساز اندروید (مسیر پشتیبان ثبت‌نام WARP).
