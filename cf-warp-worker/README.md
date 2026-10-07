@@ -36,11 +36,29 @@ npm run deploy
 
 Dashboard-only deployment (no tooling): `npm run build:single` and paste `dist/worker.min.js` into a Worker, then bind a KV namespace named `WARP_KV` and set `PANEL_PASSWORD` + `nodejs_compat`.
 
+## Deploy targets
+
+Both targets run the same code:
+
+```bash
+# Cloudflare Worker  →  https://nova-warp.<account>.workers.dev
+npm run deploy
+
+# Cloudflare Pages   →  https://nova-warp.pages.dev (WebSockets + VLESS proxy included)
+npx wrangler pages project create nova-warp     # once
+npm run deploy:pages
+npm run preview:pages                           # run the Pages bundle on the real workerd runtime, :8789
+```
+
+On Pages the KV namespace (`WARP_KV`), `PANEL_PASSWORD` and the `nodejs_compat`
+compatibility flag are configured in the project dashboard (Settings → Bindings /
+Variables / Functions). See [DEPLOY.fa.md](./DEPLOY.fa.md) (path C) for the walkthrough.
+
 ## Development
 
 ```bash
 npm run preview        # local panel preview, http://localhost:8080 (password: nova-preview) — DEMO_MODE, no Cloudflare calls
-npm test               # 81 tests, fully offline (crypto, AWG, VLESS proxy, QR vs reference, HTTP parser, importers, auth, KV, end-to-end worker suite)
+npm test               # 89 tests, fully offline (crypto, AWG, VLESS proxy, QR vs reference, HTTP parser, importers, auth, KV, end-to-end worker suite)
 npm run typecheck
 npm run build:single   # single-file bundle for the dashboard editor
 ```
@@ -60,9 +78,11 @@ npm run build:single   # single-file bundle for the dashboard editor
 
 ## Environment variables
 
-`PANEL_PASSWORD`, `SESSION_SECRET`, `API_KEY`, `PANEL_TITLE`, `PANEL_LANG`, `API_VERSION`, `TEAM_TOKEN`, `MAX_REGISTRATIONS_PER_HOUR`, `PASSWORD_ITERATIONS`, `DEMO_MODE`, `DISABLE_RAW_TLS`, `WARP_API_BASE`, `WARP_API_HEADERS`, `ALLOW_FRAMING` — see [README.fa.md](./README.fa.md#تنظیمات-و-متغیرها) for defaults and details.
+`PANEL_PASSWORD`, `SESSION_SECRET`, `API_KEY`, `PANEL_TITLE`, `PANEL_LANG`, `API_VERSION`, `TEAM_TOKEN`, `MAX_REGISTRATIONS_PER_HOUR`, `PASSWORD_ITERATIONS`, `DEMO_MODE`, `DISABLE_RAW_TLS`, `WARP_API_BASE`, `WARP_API_HEADERS`, `ALLOW_FRAMING`, `PROXY_DEBUG`, `PANEL_DEBUG` — see [README.fa.md](./README.fa.md#تنظیمات-و-متغیرها) for defaults and details.
 
 ## Troubleshooting highlights
+
+- **"Worker threw a JavaScript exception"** — the runtime used to hide the cause. The Worker now catches it and answers with an *internal error* page carrying an 8-digit error id; set `PANEL_DEBUG=1` to print the message and stack on that page, and watch `npm run tail` for the same id. The two usual culprits on a fresh deploy are a missing `nodejs_compat` compatibility flag and a missing `WARP_KV` binding.
 
 - **429 / `rate_limited` while registering** — Cloudflare throttles new registrations per client. Wait, lower `MAX_REGISTRATIONS_PER_HOUR`, or use **Import identity** (a `wgcf` profile works forever and never touches the API).
 - **`persistent: false` in the panel** — the KV binding is missing; data would be lost on restart.

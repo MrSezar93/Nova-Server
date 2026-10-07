@@ -1,9 +1,10 @@
 # راهنمای نصب گام‌به‌گام — Nova WARP Worker
 
-دو مسیر دارید؛ هرکدام را که راحت‌تر است انتخاب کنید:
+سه مسیر دارید؛ هرکدام را که راحت‌تر است انتخاب کنید:
 
-- **مسیر A — داشبورد Cloudflare (بدون نصب هیچ ابزاری)**: فقط یک فایل کد را پیست می‌کنید.
-- **مسیر B — Wrangler (خط فرمان)**: برای آپدیت‌های بعدی و اجرای محلی بهتر است.
+- **مسیر A — داشبورد Cloudflare (بدون نصب هیچ ابزاری)**: فقط یک فایل کد را پیست می‌کنید → آدرس `*.workers.dev`
+- **مسیر B — Wrangler (خط فرمان)**: برای آپدیت‌های بعدی و اجرای محلی بهتر است → آدرس `*.workers.dev`
+- **مسیر C — Cloudflare Pages**: اگر می‌خواهید دامنه‌ی نهایی `*.pages.dev` باشد (مثلاً `nova-warp.pages.dev`) — همان Worker، فقط روی Pages؛ پروکسی VLESS هم روی Pages کار می‌کند.
 
 ---
 
@@ -132,6 +133,72 @@ npm run deploy
 
 ---
 
+## مسیر C — Cloudflare Pages (دامنه‌ی `pages.dev`)
+
+همان کد، روی Pages؛ نتیجه یک دامنه‌ی `<project>.pages.dev` با TLS است و پروکسی VLESS هم روی آن کار می‌کند.
+
+### گام ۱: ساخت بسته‌ی Pages
+
+```bash
+cd cf-warp-worker
+npm install
+npm run build:pages
+#  → dist/pages/_worker.js  (حالت Advanced Mode)
+#  → dist/pages/_routes.json
+```
+
+### گام ۲: ساخت پروژه و انتشار
+
+**راه ۱ — با Wrangler (ساده‌تر):**
+
+```bash
+npx wrangler login
+npx wrangler pages project create nova-warp --production-branch main   # فقط بار اول
+npm run deploy:pages
+#  ✔ Published → https://nova-warp.pages.dev
+```
+
+**راه ۲ — بدون ابزار (داشبورد):** **Workers & Pages → Create → Pages → Upload assets** → نام پروژه (مثلاً `nova-warp`) → پوشه‌ی `dist/pages` را آپلود کنید → **Deploy**. (برای آپدیت‌های بعدی همین مسیر را تکرار کنید.)
+
+> اگر روی Pages از Git استفاده می‌کنید (اتصال مخزن)، در تنظیمات Build پروژه:
+> Build command = `npm run build:pages` و Build output directory = `dist/pages`.
+
+### گام ۳: اتصال KV و متغیرها (اجباری)
+
+Pages برخلاف Worker تنظیمات را از `wrangler.toml` برنمی‌دارد؛ در **داشبورد پروژه → Settings**:
+
+1. **Bindings → Add → KV namespace**: نام متغیر = `WARP_KV`، مقدار = همان فضای KV که ساختید (اگر ندارید: **Workers & Pages → KV → Create**).
+2. **Variables and Secrets**: `PANEL_PASSWORD` (و `SESSION_SECRET`) را به‌صورت **Secret** اضافه کنید. در صورت نیاز `PANEL_TITLE`, `PANEL_LANG`, `PROXY_DEBUG`, `PANEL_DEBUG`.
+3. **Functions → Compatibility flags**: فلگ `nodejs_compat` را اضافه کنید (برای مسیر پشتیبان TLS و `nodejs_compat` لازم است) و Compatibility date را `2025-08-01` یا جدیدتر بگذارید.
+4. یک بار **Deploy** مجدد (Retry deployment) تا تنظیمات اعمال شوند.
+
+### گام ۴: آزمایش
+
+```bash
+curl -s https://nova-warp.pages.dev/healthz
+# {"ok":true,"worker":"nova-warp","kv":true,…}
+```
+
+- `"kv":true` یعنی binding درست است.
+- آدرس را در مرورگر باز کنید → رمز → پنل.
+
+### نکته‌های مخصوص Pages
+
+- **همان فایل، همان قابلیت‌ها:** پنل، QR، لینک اشتراک، پروکسی VLESS (`/ws/<uuid>`) و کانفیگ‌های WireGuard/AmneziaWG همه کار می‌کنند؛ WebSocket روی Pages پشتیبانی می‌شود.
+- **آدرس پروکسی:** لینک‌های `vless://` خودشان میزبان درخواست را می‌گیرند، پس بعد از باز کردن پنل روی `*.pages.dev` لینک‌ها هم با همان دامنه ساخته می‌شوند (نیازی به تنظیم دستی نیست). اگر دامنه‌ی اختصاصی دارید، در تنظیمات پنل `proxyDomain` را بگذارید.
+- **دو پروژه، یک KV:** می‌توانید همه‌ی سرویس‌ها را هم‌زمان روی `*.workers.dev` (مسیر A/B) و `*.pages.dev` (مسیر C) داشته باشید؛ اگر هر دو به یک KV وصل باشند، داده‌ها مشترک‌اند.
+- **حذف:** Pages → پروژه → Settings → Delete project (فضای KV جدا حذف می‌شود).
+
+### پیش‌نمایش محلی بسته‌ی Pages
+
+قبل از دیپلوی می‌توانید همان بسته را روی ران‌تایم واقعی Workers اجرا کنید:
+
+```bash
+npm run preview:pages     # http://localhost:8789  (KV محلی)
+```
+
+---
+
 ## بعد از نصب: چه کاری انجام دهیم؟
 
 1. وارد پنل شوید.
@@ -187,3 +254,4 @@ npm run deploy
 - [ ] اگر ثبت‌نام ۴۲۹ داد: از «ورود هویت» (`wgcf`) استفاده شد
 - [ ] (اختیاری) یک کانفیگ AmneziaWG ساخته و در AmneziaVPN/FLClash/Hiddify وارد شد
 - [ ] (اختیاری) یک پروکسی VLESS ساخته و لینکش در v2rayNG/Hiddify/NekoBox کار کرد
+- [ ] (اختیاری، مسیر C) پروژه‌ی Pages ساخته شد، binding `WARP_KV` و فلگ `nodejs_compat` تنظیم شد و `https://<project>.pages.dev/healthz` جواب `"kv":true` داد

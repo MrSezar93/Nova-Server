@@ -149,6 +149,56 @@ async function requireAuth(context: RequestContext): Promise<AuthResult> {
   return result;
 }
 
+/**
+ * Renders the diagnostic page shown for uncaught exceptions. The Cloudflare
+ * "Worker threw a JavaScript exception" page hides the message, so instead of
+ * bubbling up we answer with the error itself (and log it, where `wrangler tail`
+ * can see it). `PANEL_DEBUG=1` exposes the stack trace on the page — handy while
+ * a fresh deployment is being wired up, off by default.
+ */
+function renderCrashPage(error: unknown, url: URL, debug: boolean): Response {
+  const message = error instanceof Error ? error.message : String(error);
+  const stack = error instanceof Error && error.stack ? error.stack : "";
+  const wantsJson = url.pathname.startsWith("/api/") || url.pathname.startsWith("/ws/");
+  const fingerprint = shortFingerprint(stack || message);
+  console.error(`unhandled error [${fingerprint}] ${url.pathname}`, error);
+  if (wantsJson) {
+    return json(
+      {
+        error: "internal",
+        message: "خطای غیرمنتظره در Worker رخ داد.",
+        id: fingerprint,
+        ...(debug ? { detail: message, stack } : {}),
+      },
+      { status: 500 },
+    );
+  }
+  const body = [
+    "خطای غیرمنتظره در Worker رخ داد.",
+    "",
+    `مسیر: ${url.pathname}`,
+    `شناسه‌ی خطا: ${fingerprint}`,
+  ];
+  if (debug) {
+    body.push("", `پیام: ${message}`);
+    if (stack) body.push("", stack.split("\n").slice(0, 8).join("\n"));
+  } else {
+    body.push("", "برای دیدن جزئیات، متغیر محیطی PANEL_DEBUG=1 را تنظیم کنید و صفحه را دوباره باز کنید.");
+  }
+  return htmlResponse(renderMessagePage({ panelTitle: "Nova WARP", lang: "fa", heading: "خطای داخلی", message: body.join("\n") }), {
+    status: 500,
+  });
+}
+
+function shortFingerprint(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 function handleError(error: unknown): Response {
   if (error instanceof HttpError) {
     return json({ error: error.code ?? "error", message: error.message }, { status: error.status });
@@ -919,6 +969,18 @@ function publicClient(client: ClientRecord) {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (error) {
+      // Never let the runtime show its opaque "Worker threw a JavaScript
+      // exception" page: answer with something the operator can act on.
+      return renderCrashPage(error, new URL(request.url), env.PANEL_DEBUG === "1");
+    }
+  },
+};
+
+async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  {
     // `ALLOW_FRAMING=1` lets the panel be embedded (local previews); production
     // keeps X-Frame-Options: DENY + frame-ancestors 'none'.
     configureFraming(env.ALLOW_FRAMING === "1" || env.ALLOW_FRAMING === "true");
@@ -976,5 +1038,5 @@ export default {
     } catch (error) {
       return handleError(error);
     }
-  },
-};
+  }
+}

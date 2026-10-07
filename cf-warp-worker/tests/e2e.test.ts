@@ -463,3 +463,40 @@ describe("worker end to end (mocked WARP API)", () => {
     assert.equal((await call("GET", "/api/v1/state")).status, 200);
   });
 });
+
+describe("crash diagnostics", () => {
+  /** An env variable that throws as soon as it is read, like a real crash. */
+  function crashingEnv(extra: Partial<Env> = {}): Env {
+    const env2 = makeEnv(extra);
+    Object.defineProperty(env2 as object, "ALLOW_FRAMING", {
+      get() {
+        throw new Error("boom: simulated runtime failure");
+      },
+    });
+    return env2 as unknown as Env;
+  }
+
+  it("answers with a diagnostic page instead of the runtime's error page", async () => {
+    const page = await worker.fetch(new Request(`${BASE}/`), crashingEnv(), fakeExecutionContext());
+    assert.equal(page.status, 500);
+    const html = await page.text();
+    assert.match(html, /خطای داخلی/);
+    assert.match(html, /شناسه‌ی خطا/);
+    assert.match(html, /PANEL_DEBUG/, "the page tells the operator how to see details");
+    assert.doesNotMatch(html, /simulated runtime failure/, "details stay hidden by default");
+  });
+
+  it("returns machine readable details for api routes when PANEL_DEBUG=1", async () => {
+    const api = await worker.fetch(
+      new Request(`${BASE}/api/v1/state`),
+      crashingEnv({ PANEL_DEBUG: "1" }),
+      fakeExecutionContext(),
+    );
+    assert.equal(api.status, 500);
+    const payload = (await api.json()) as Record<string, string>;
+    assert.equal(payload.error, "internal");
+    assert.match(payload.detail ?? "", /simulated runtime failure/);
+    assert.match(payload.stack ?? "", /simulated runtime failure/);
+    assert.match(payload.id ?? "", /^[0-9a-f]{8}$/);
+  });
+});

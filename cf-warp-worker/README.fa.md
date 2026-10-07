@@ -80,6 +80,16 @@ npm run deploy
 
 خروجی، آدرسی مثل `https://nova-warp.<نام-حساب>.workers.dev` است. همان را در مرورگر باز کنید.
 
+> 🌐 **دامنه‌ی `pages.dev` می‌خواهید؟** همین Worker بدون تغییر کد روی **Cloudflare Pages** هم اجرا می‌شود:
+>
+> ```bash
+> npm run build:pages                                   # → dist/pages/_worker.js
+> npx wrangler pages project create nova-warp           # یک‌بار
+> npm run deploy:pages                                  # → https://nova-warp.pages.dev
+> ```
+>
+> سپس در داشبورد Pages در **Settings → Functions** مقدار `nodejs_compat` را به Compatibility flags و در **Settings → Bindings** فضای KV با نام `WARP_KV` (و در صورت نیاز `PANEL_PASSWORD` و بقیه‌ی متغیرها) را اضافه کنید. جزئیات گام‌به‌گام: [DEPLOY.fa.md § مسیر C](./DEPLOY.fa.md).
+
 > اگر می‌خواهید همه‌چیز با یک دستور انجام شود:
 > `npx wrangler kv namespace create WARP_KV && npm run deploy`
 > (شناسه‌ی KV را دستی در `wrangler.toml` جای‌گذاری کنید.)
@@ -93,7 +103,10 @@ npm run deploy
 | `npm run typecheck` | بررسی تایپ‌ها (`tsc --noEmit`) |
 | `npm run build` | باندل خوانا → `dist/worker.js` |
 | `npm run build:single` | خروجی تک‌فایل و مینیفای‌شده → `dist/worker.min.js` |
-| `npm test` | اجرای ۸۱ تست (crypto، AWG، پروکسی VLESS، QR، API، پنل، مسیرهای اشتراک) |
+| `npm run build:pages` | خروجی مخصوص Cloudflare Pages → `dist/pages/_worker.js` + `_routes.json` |
+| `npm run deploy:pages` | انتشار روی `<project>.pages.dev` (با wrangler pages) |
+| `npm run preview:pages` | اجرای بستهٔ Pages روی ران‌تایم واقعی workerd (پورت ۸۷۸۹) |
+| `npm test` | اجرای ۸۹ تست (crypto، AWG، پروکسی VLESS، QR، API، پنل، مسیرهای اشتراک) |
 | `npm run preview` | پیش‌نمایش محلی پنل بدون Cloudflare (پورت ۸۰۸۰، رمز `nova-preview`) |
 | `npm run tail` | مشاهده‌ی زنده‌ی لاگ Worker |
 
@@ -139,6 +152,8 @@ npm run deploy
 | `DISABLE_RAW_TLS` | `0` | `1` = غیرفعال‌کردن مسیر پشتیبان TLS. |
 | `WARP_API_BASE` / `WARP_API_HEADERS` | — | فقط برای تست/دیباگ (تغییر میزبان API و افزودن هدر JSON). |
 | `ALLOW_FRAMING` | `0` | `1` = حذف `X-Frame-Options` و `frame-ancestors` (فقط برای پیش‌نمایش/Embed داخلی؛ در محیط واقعی خاموش بگذارید). |
+| `PANEL_DEBUG` | `0` | `1` = نمایش پیام/استک خطاهای غیرمنتظره روی صفحه‌ی خطا (به‌جای «Worker threw a JavaScript exception»). برای دیباگ دیپلوی تازه؛ بعداً خاموش کنید. |
+| `PROXY_DEBUG` | `0` | `1` = چاپ جزئیات سشن‌های پروکسی در لاگ (`wrangler tail`). |
 
 ### تنظیمات پنل (ذخیره در KV، از تب «تنظیمات»)
 
@@ -417,10 +432,20 @@ npm run preview        # http://localhost:8080  — رمز: nova-preview
 پیش‌نمایش با `DEMO_MODE=1` اجرا می‌شود: یک هویت آزمایشی، دو کانفیگ نمونه (یکی AmneziaWG) و یک پروکسی VLESS ساخته می‌شود تا پنل، QR، صفحه‌ی اشتراک و API را بدون تماس با کلادفلر ببینید. (کانفیگ‌های DEMO واقعی نیستند و تونل VLESS در محیط پیش‌نمایش محلی — که WebSocket ندارد — `501` می‌دهد.)
 
 ```bash
-npm test               # ۸۱ تست بدون شبکه
+npm test               # ۸۹ تست بدون شبکه
 npm run typecheck      # بررسی تایپ‌ها
 npm run build:single   # خروجی تک‌فایل برای داشبورد
+npm run build:pages    # خروجی مخصوص Cloudflare Pages
 ```
+
+آزمودن مسیر داده‌ی پروکسی روی **ران‌تایم واقعی Workers (workerd)** بدون هیچ دیپلویی:
+
+```bash
+npm run dev            # ترمینال ۱ — ران‌تایم واقعی روی پورت ۸۷۸۷ (KV محلی)
+npm run preview:pages  # بسته‌ی Pages روی همان ران‌تایم، پورت ۸۷۸۹
+```
+
+مسیر پیشنهادی: پنل را روی `http://localhost:8787` باز کنید، یک پروکسی بسازید و لینکش را در کلاینت خودتان (v2rayNG / Hiddify / NekoBox / Clash.Meta) وارد کنید — روی localhost هم واقعاً تونل می‌شود (چون در همان ران‌تایم کلادفلر اجرا می‌شود).
 
 پوشش تست‌ها: رمزنگاری X25519 و کلید عمومی، محاسبه‌ی `reserved`، رندر همه‌ی قالب‌ها، حذف شبکه‌ی محلی (`exclude-lan`)، ماتریس QR در مقایسه با پیاده‌سازی مرجع (همه‌ی نسخه‌ها و سطوح)، پارسر HTTP خام، ورود هویت‌ها از conf/TOML/JSON/کلید، احراز هویت و throttle، ذخیره‌سازی KV و یک سوئیت end-to-end روی خود Worker (ثبت‌نام با API جعلی، ساخت کانفیگ، لینک اشتراک، چرخش کلید، سهمیه، CSRF).
 
@@ -454,6 +479,7 @@ npm run build:single   # خروجی تک‌فایل برای داشبورد
 | QR ساخته نمی‌شود | کانفیگ بزرگ‌تر از ظرفیت ۴۰ نسخه‌ی QR | فایل را دانلود کنید یا `includeIPv6` و DNS را کم کنید. |
 | «این لینک معتبر نیست» | کانفیگ حذف یا غیرفعال شده | در پنل، وضعیت کانفیگ را ببینید. |
 | `too many attempts` هنگام ورود | throttle ورود | ۱۰ دقیقه صبر کنید یا IP دیگری امتحان کنید. |
+| صفحه‌ی «Worker threw a JavaScript exception» | خطای غیرمنتظره‌ی ران‌تایم (اغلب: نبود `nodejs_compat` یا نبود binding مربوط به `WARP_KV`) | کد جدید این خطا را می‌گیرد و صفحه‌ی «خطای داخلی» با یک **شناسه‌ی ۸ رقمی** نشان می‌دهد؛ متغیر `PANEL_DEBUG=1` را اضافه کنید تا پیام و استک دقیق روی همان صفحه بیاید، و `npm run tail` را هم‌زمان ببینید. سپس `nodejs_compat` را فعال و `WARP_KV` را وصل کنید. |
 | پروکسی VLESS وصل نمی‌شود | مسیر یا پورت اشتباه در لینک | در پنل تب پروکسی لینک را دوباره کپی کنید؛ اگر دامنه‌ی اختصاصی دارید `proxyDomain`/`proxyPort` و اگر Worker روی `workers.dev` است پورت باید ۴۴۳ باشد. |
 | کانفیگ AWG در کلاینت باز نمی‌شود | کلاینت فیلدهای AWG را نمی‌فهمد | از AmneziaVPN / FLClash / Hiddify / awg استفاده کنید؛ برای اپ رسمی WireGuard قالب `wg` را بگیرید. |
 | در AWG `mode = custom` اتصال قطع می‌شود | سرور WARP استاندارد `S≠0`/`H≠1,2,3,4` را رد می‌کند | `mode = warp-safe` را بگذارید یا این تنظیمات را برای سرور AmneziaWG خودتان نگه دارید. |
@@ -472,6 +498,9 @@ npm run build:single   # خروجی تک‌فایل برای داشبورد
 | شبکه WireGuard ساده را با DPI می‌بندد (ایران/چین/شبکه‌ی اداری) | **کانفیگ `amneziawg`** با `mode=warp-safe` |
 | فقط مرورگر/برخی اپ‌ها را می‌خواهید از کلادفلر رد کنید، یا کلاینت شما WireGuard ندارد | **پروکسی VLESS** (لینک `vless://`) |
 | هر دو را با هم می‌خواهید | کانفیگ AWG برای کل دستگاه + پروکسی برای اپ‌های خاص (یا برعکس)، هر کدام UUID/توکن جدا |
+
+**روی `pages.dev` هم می‌شود؟**
+بله. همان کد روی Cloudflare Pages هم اجرا می‌شود (`npm run build:pages` و بعد `npm run deploy:pages`) و پروکسی VLESS روی `<project>.pages.dev` هم کار می‌کند؛ KV و متغیرها را در تنظیمات پروژه‌ی Pages وصل می‌کنید. راهنمای کامل: بخش «مسیر C» در `DEPLOY.fa.md`.
 
 **آیا ترافیک من واقعاً از کلادفلر عبور می‌کند؟**
 بله. دستگاه شما با پروتکل WireGuard به لبه‌ی WARP (شبکه‌ی کلادفلر) تونل می‌زند و خروجی ترافیک از آنجا است. Worker فقط کانفیگ/هویت را تحویل می‌دهد.
@@ -507,12 +536,12 @@ npm run build:single   # خروجی تک‌فایل برای داشبورد
 ```
 cf-warp-worker/
 ├─ src/
-│  ├─ index.ts              روتر Worker و API  (/, /login, /setup, /api/v1/*, /c/:token, /qr/:token, /sub/:token, /healthz, /ws/<uuid>)
+│  ├─ index.ts              روتر Worker و API  (/, /login, /setup, /api/v1/*, /c/:token, /qr/:token, /sub/:token, /healthz, /ws/<uuid>) + صفحه‌ی خطای دیباگ
 │  ├─ types.ts              تایپ‌ها + DEFAULT_SETTINGS
 │  ├─ lib/
 │  │  ├─ wg.ts              کلید X25519، reserved، انتخاب endpoint، رندر ۶ قالب کانفیگ (شامل amneziawg)
 │  │  ├─ awg.ts             AmneziaWG: نرمال‌سازی/clamp، بسته‌های آشغال و بسته‌های جعلی CPS (QUIC/STUN/DTLS/DNS)
-│  │  ├─ proxy.ts           VLESS روی WebSocket: پارس هدر، لاگ اشتراک، پل TCP با connect()
+│  │  ├─ proxy.ts           VLESS روی WebSocket: پارس پیام سه‌بخشی (uuid/هدر/early-data)، لینک اشتراک، پل TCP با connect()
 │  │  ├─ warp.ts            کلاینت API کلادفلر (ثبت‌نام/گرفتن/لایسنس/…) + مسیر پشتیبان TLS
 │  │  ├─ rawhttp.ts         درخواست HTTP روی سوکت خام TLS و پارسر chunked/content-length
 │  │  ├─ importer.ts        تشخیص و ورود conf / TOML / JSON / کلید خام
@@ -523,9 +552,10 @@ cf-warp-worker/
 │  │  ├─ qr.ts              تولیدکننده‌ی کامل QR (۴۰ نسخه × ۴ سطح ECC) به SVG
 │  │  └─ b64.ts             base64/base64url/hex، HMAC، SHA-256، مقایسه‌ی زمان‌ثابت
 │  └─ ui/                   پنل فارسی: i18n، تم، اسکریپت SPA و قالب صفحه‌ها
-├─ scripts/                 build (esbuild) / test / preview محلی
-├─ tests/                   ۸۱ تست (node:test): wg / importer / auth / store / warp / awg / proxy / rawhttp / qr + سوئیت end-to-end
-├─ wrangler.toml
+├─ scripts/                 build (esbuild: worker / single / pages) / test / preview محلی
+├─ tests/                   ۸۹ تست (node:test): wg / importer / auth / store / warp / awg / proxy / rawhttp / qr + سوئیت end-to-end
+├─ wrangler.toml            تنظیمات Worker
+├─ wrangler.pages.toml      اجرای محلی بسته‌ی Pages روی workerd
 ├─ README.fa.md             همین فایل
 ├─ DEPLOY.fa.md             راهنمای گام‌به‌گام نصب
 └─ README.md               نسخه‌ی انگلیسی خلاصه

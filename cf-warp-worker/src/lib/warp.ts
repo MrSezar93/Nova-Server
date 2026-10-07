@@ -230,8 +230,15 @@ export class WarpApi {
         return await attemptRawTls();
       } catch (error) {
         preferredTransport = "fetch";
-        if (!(error instanceof WarpApiError) || error.kind === "network") throw error;
-        throw error;
+        if (error instanceof WarpApiError) throw error;
+        // Usually a runtime without the `nodejs_compat` flag: report it instead
+        // of letting the panel show a generic exception.
+        throw new WarpApiError(
+          "blocked",
+          "مسیر پشتیبان TLS در این Worker قابل استفاده نیست (فلگ nodejs_compat را فعال کنید) — از «ورود هویت دستی» هم می‌توانید استفاده کنید.",
+          502,
+          String(error),
+        );
       }
     }
 

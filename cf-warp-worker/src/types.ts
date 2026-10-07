@@ -30,6 +30,8 @@ export interface Env {
   TEAM_TOKEN?: string;
   /** "1" prints proxy-session errors to the Worker log (wrangler tail). */
   PROXY_DEBUG?: string;
+  /** "1" shows uncaught-exception details (message + stack) on the error page. */
+  PANEL_DEBUG?: string;
   /**
    * "1" removes `X-Frame-Options`/`frame-ancestors` so the panel can be embedded
    * in an iframe (used by the local preview harness; leave unset in production).

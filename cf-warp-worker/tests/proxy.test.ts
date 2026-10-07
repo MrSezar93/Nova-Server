@@ -13,7 +13,9 @@ import {
   newUuid,
   normalizeProxyPath,
   parseHttpHead,
+  parseVlessMessage,
   parseVlessRequest,
+  readEarlyData,
   proxyMeta,
   runVlessSession,
   setSocketConnector,
@@ -37,6 +39,30 @@ afterEach(() => {
 });
 
 /** Builds a VLESS request header (+ optional payload). */
+const TEST_UUID = "2076b1a8-6e6c-4d1c-9a1e-2f8a3c5d7e90";
+const TEST_UUID_BYTES = Uint8Array.from(TEST_UUID.replace(/-/g, "").match(/.{2}/g)!.map((pair) => parseInt(pair, 16)));
+
+/**
+ * A message as a real client sends it:
+ *   [version][uuid 16B][addon length][command][port 2B][atyp][address][addons]
+ */
+function vlessMessage(options: {
+  command?: number;
+  address: string;
+  port: number;
+  version?: number;
+  addons?: Uint8Array;
+}): Uint8Array {
+  const addons = options.addons ?? new Uint8Array(0);
+  const prefix = new Uint8Array([options.version ?? 0, ...TEST_UUID_BYTES, addons.byteLength]);
+  const encoded = new TextEncoder().encode(options.address);
+  const body: number[] = [options.command ?? 1, (options.port >> 8) & 0xff, options.port & 0xff];
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(options.address)) body.push(1, ...options.address.split(".").map(Number));
+  else if (options.address.includes(":")) body.push(3);
+  else body.push(2, encoded.length, ...encoded);
+  return concatBytes([prefix, Uint8Array.from(body), addons]);
+}
+
 function vlessHeader(options: {
   command?: number;
   address: string;
@@ -185,7 +211,7 @@ describe("vless session", () => {
       return socket;
     });
 
-    const header = vlessHeader({ address: "example.com", port: 80 });
+    const header = vlessMessage({ address: "example.com", port: 80 });
     const payload = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
     const session = runVlessSession(server, concatBytes([header, payload]));
 
@@ -199,9 +225,9 @@ describe("vless session", () => {
     const first = client.received[0] as Uint8Array;
     assert.deepEqual(Array.from(first), [0, 0]);
 
-    // upstream → client (the request payload was already echoed as frame #1)
+    // upstream → client
     sockets[0].push(new TextEncoder().encode("HTTP/1.0 200 OK\r\n\r\nhi"));
-    await waitFor(() => client.received.length >= 3);
+    await waitFor(() => client.received.length >= 2);
     const upstreamFrame = client.received[client.received.length - 1] as Uint8Array;
     assert.match(new TextDecoder().decode(upstreamFrame), /200 OK/);
 
@@ -214,6 +240,36 @@ describe("vless session", () => {
     await session;
   });
 
+  it("waits for a header that arrives after the session started", async () => {
+    // Regression: a real client sends its first frame *after* the 101, so the
+    // byte source has to keep accounting for chunks that arrive while reading.
+    const { server } = fakeSocketPair();
+    const sockets: FakeSocket[] = [];
+    setSocketConnector((address) => {
+      const socket = new FakeSocket(typeof address === "string" ? address : `${address.hostname}:${address.port}`);
+      sockets.push(socket);
+      return socket;
+    });
+
+    const session = runVlessSession(server, new Uint8Array(0));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    server.deliver(vlessMessage({ address: "10.0.0.1", port: 3128 }));
+    await waitFor(() => sockets.length === 1);
+    assert.equal(sockets[0].address, "10.0.0.1:3128");
+    server.close(1000, "done");
+    await session;
+    assert.equal(sockets[0].closedFlag, true, "the upstream socket is torn down with the client");
+  });
+
+  it("reads xray early data out of the upgrade body", async () => {
+    const body = concatBytes([vlessMessage({ address: "203.0.113.7", port: 8443 }), new TextEncoder().encode("ping")]);
+    const withBody = new Request("https://panel.test/ws/uuid?ed=2048", { method: "POST", body });
+    assert.deepEqual([...(await readEarlyData(withBody))], [...body]);
+
+    const empty = new Request("https://panel.test/ws/uuid?ed=2048", { method: "POST" });
+    assert.equal((await readEarlyData(empty)).byteLength, 0);
+  });
+
   it("rejects UDP and malformed headers without opening a socket", async () => {
     let connections = 0;
     setSocketConnector(() => {
@@ -222,12 +278,12 @@ describe("vless session", () => {
     });
 
     const udp = fakeSocketPair();
-    await runVlessSession(udp.server, vlessHeader({ address: "1.1.1.1", port: 53, command: 2 }));
+    await runVlessSession(udp.server, vlessMessage({ address: "1.1.1.1", port: 53, command: 2 }));
     assert.equal(connections, 0);
     assert.equal(udp.server.closeCode, 1003);
 
     const bad = fakeSocketPair();
-    await runVlessSession(bad.server, new Uint8Array([0, 9, 0, 80, 1, 1, 1, 1, 1]));
+    await runVlessSession(bad.server, new Uint8Array([0, 1, 2, 3]));
     assert.equal(bad.server.closeCode, 1002);
   });
 
@@ -246,7 +302,7 @@ describe("vless session", () => {
     }) as typeof fetch;
 
     try {
-      const header = vlessHeader({ address: "example.com", port: 80 });
+      const header = vlessMessage({ address: "example.com", port: 80 });
       const payload = new TextEncoder().encode("GET /hello HTTP/1.1\r\nHost: example.com\r\n\r\n");
       await runVlessSession(server, concatBytes([header, payload]));
 
@@ -265,7 +321,73 @@ describe("vless session", () => {
     const { server } = fakeSocketPair();
     setSocketConnector(null);
     // TLS ClientHello-ish bytes: not HTTP, so nothing can be forwarded.
-    await runVlessSession(server, concatBytes([vlessHeader({ address: "1.1.1.1", port: 443 }), new Uint8Array([22, 3, 1, 0, 5])]));
+    await runVlessSession(server, concatBytes([vlessMessage({ address: "1.1.1.1", port: 443 }), new Uint8Array([22, 3, 1, 0, 5])]));
     assert.equal(server.closeCode, 1011);
+  });
+});
+
+describe("vless messages as sent on the wire", () => {
+  const uuid = TEST_UUID;
+  const uuidBytes = TEST_UUID_BYTES;
+
+  function message(options: {
+    address: string;
+    port: number;
+    atyp?: number;
+    addons?: Uint8Array;
+    version?: number;
+    body?: Uint8Array;
+  }): Uint8Array {
+    const portBytes = [options.port >> 8, options.port & 0xff];
+    const addons = options.addons ?? new Uint8Array(0);
+    const head: number[] = [options.version ?? 0, ...uuidBytes, addons.byteLength, 1, ...portBytes];
+    if (options.atyp === 2) {
+      const name = new TextEncoder().encode(options.address);
+      head.push(2, name.length, ...name);
+    } else {
+      head.push(1, ...options.address.split(".").map(Number));
+    }
+    return concatBytes([Uint8Array.from([...head, ...addons]), options.body ?? new Uint8Array(0)]);
+  }
+
+  it("parses a real client message including the 17-byte prefix", () => {
+    const body = new TextEncoder().encode("GET / HTTP/1.0\r\n\r\n");
+    const parsed = parseVlessMessage(message({ address: "127.0.0.1", port: 8080, body }));
+    assert.ok("message" in parsed);
+    assert.equal(parsed.message.uuid, uuid);
+    assert.equal(parsed.message.command, 1);
+    assert.equal(parsed.message.port, 8080);
+    assert.equal(parsed.message.address, "127.0.0.1");
+    assert.equal(parsed.message.headerLength, 26, "17 prefix bytes + 9 header bytes");
+    assert.equal(parsed.message.addonLength, 0);
+    assert.deepEqual(
+      [...message({ address: "127.0.0.1", port: 8080, body }).subarray(parsed.message.headerLength)],
+      [...body],
+    );
+  });
+
+  it("skips addons and domain addresses", () => {
+    const addons = new Uint8Array([0xaa, 0xbb, 0xcc]);
+    const parsed = parseVlessMessage(message({ address: "example.com", port: 443, atyp: 2, addons }));
+    assert.ok("message" in parsed);
+    assert.equal(parsed.message.address, "example.com");
+    assert.equal(parsed.message.headerLength, 17 + 6 + "example.com".length + 3);
+  });
+
+  it("waits for bytes that have not arrived yet", () => {
+    const full = message({ address: "1.1.1.1", port: 53 });
+    for (const cut of [1, 5, 17, 24]) {
+      assert.deepEqual(parseVlessMessage(full.subarray(0, cut)), { incomplete: true }, `cut at ${cut}`);
+    }
+    const withAddons = message({ address: "1.1.1.1", port: 53, addons: new Uint8Array([1, 2, 3, 4]) });
+    assert.deepEqual(parseVlessMessage(withAddons.subarray(0, withAddons.byteLength - 2)), { incomplete: true });
+    assert.ok("message" in parseVlessMessage(withAddons));
+  });
+
+  it("rejects junk before opening a socket", () => {
+    assert.deepEqual(parseVlessMessage(new Uint8Array([0, 1, 2, 3])), { incomplete: true });
+    const bad = message({ address: "1.1.1.1", port: 53 });
+    bad[18] = 7; // command must be 1..3
+    assert.deepEqual(parseVlessMessage(bad), { invalid: true });
   });
 });

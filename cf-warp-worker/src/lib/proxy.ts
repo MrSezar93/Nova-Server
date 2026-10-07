@@ -195,6 +195,47 @@ export interface VlessRequest {
 
 export type VlessParseResult = { request: VlessRequest } | { incomplete: true } | { invalid: true };
 
+/** A complete VLESS request message, prefix included. */
+export interface VlessMessage extends VlessRequest {
+  /** User id sent inside the message (the URL uuid is the authoritative one). */
+  uuid: string;
+  /** Number of extra bytes the client appended after the address (`addons`). */
+  addonLength: number;
+}
+
+export type VlessMessageResult = { message: VlessMessage } | { incomplete: true } | { invalid: true };
+
+/** Bytes before the command: version (1) + uuid (16) + addon length (1). */
+const VLESS_PREFIX_LENGTH = 17;
+
+/**
+ * Parses a real VLESS request as it arrives on the socket:
+ *
+ *   [version 1B][uuid 16B][addon length 1B][command 1B][port 2B][atyp 1B][address …][addons]
+ *
+ * {@link parseVlessRequest} works on the bytes from the addon-length byte on
+ * (that is what the low-level unit tests build); this wrapper is what the session
+ * uses, because a client writes the whole message, uuid included.
+ */
+export function parseVlessMessage(bytes: Uint8Array): VlessMessageResult {
+  if (bytes.length < VLESS_PREFIX_LENGTH + 5) return { incomplete: true };
+  const version = bytes[0];
+  const uuid = formatUuid(bytes.subarray(1, 17));
+  const addonLength = bytes[17];
+  const rest = parseVlessRequest(bytes.subarray(VLESS_PREFIX_LENGTH));
+  if ("incomplete" in rest) return { incomplete: true };
+  if ("invalid" in rest) return { invalid: true };
+  const headerLength = VLESS_PREFIX_LENGTH + rest.request.headerLength + addonLength;
+  if (bytes.length < headerLength) return { incomplete: true };
+  return { message: { ...rest.request, version, uuid, addonLength, headerLength } };
+}
+
+/** `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` for a 16-byte buffer. */
+function formatUuid(bytes: Uint8Array): string {
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 /** Parses the VLESS request header (version, command, port, address). */
 export function parseVlessRequest(bytes: Uint8Array): VlessParseResult {
   if (bytes.length < 5) return { incomplete: true };
@@ -267,14 +308,22 @@ async function getConnector(): Promise<Connector | null> {
   return connectorCache;
 }
 
-/** Byte queue on top of the WebSocket event API (pull based). */
-class WsSource {
+/**
+ * Byte queue on top of the WebSocket event API (pull based).
+ *
+ * It must be constructed *synchronously* after `socket.accept()`: workerd drops
+ * messages that arrive while no listener is attached, and a client that pipelines
+ * its VLESS header right after the upgrade would otherwise lose it.
+ */
+export class WsSource {
   private chunks: Uint8Array[] = [];
   private waiters: Array<(value: Uint8Array | null) => void> = [];
   private ended = false;
 
-  constructor(socket: WebSocket) {
+  constructor(socket: WebSocket, debug = false) {
+    if (debug) console.log(`[proxy] websocket listener attached (state ${socket.readyState})`);
     socket.addEventListener("message", (event: MessageEvent) => {
+      if (debug) console.log(`[proxy] frame received (${Object.prototype.toString.call(event.data)})`);
       const data = event.data as ArrayBuffer | ArrayBufferView | string;
       let bytes: Uint8Array;
       if (typeof data === "string") {
@@ -339,6 +388,9 @@ class WsSource {
     while (this.buffered() < size) {
       const chunk = timeoutMs ? await this.readWithTimeout(timeoutMs) : await this.read();
       if (!chunk) break;
+      // `readWithTimeout` hands the chunk straight to the caller, so it has to be
+      // put back before `buffered()` can account for it.
+      this.chunks.push(chunk);
     }
     return this.takeAll();
   }
@@ -378,6 +430,8 @@ export interface VlessSessionHooks {
   /** Called instead of closing a WebSocket the session does not own. */
   close?: (code: number, reason: string) => void;
   debug?: boolean;
+  /** Pre-attached byte source (see {@link WsSource}); created on demand otherwise. */
+  source?: WsSource;
 }
 
 /**
@@ -404,22 +458,30 @@ export async function runVlessSession(
     }
   };
 
-  const source = new WsSource(server);
+  const source = hooks.source ?? new WsSource(server, hooks.debug);
+  if (hooks.debug) console.log(`[proxy] session start (${early.byteLength} early bytes)`);
   try {
     let buffer = early;
-    let parsed = parseVlessRequest(buffer);
+    let parsed = parseVlessMessage(buffer);
     let guard = 0;
     while ("incomplete" in parsed && guard++ < 8) {
       // A silent client must not keep the isolate alive forever.
-      const chunk = await source.readUntil(5, guard === 1 ? 10_000 : 2_000);
+      const chunk = await source.readUntil(VLESS_PREFIX_LENGTH + 5, guard === 1 ? 10_000 : 2_000);
       if (!chunk.byteLength) break;
       buffer = concat(buffer, chunk);
       if (buffer.byteLength > 4096) break;
-      parsed = parseVlessRequest(buffer);
+      parsed = parseVlessMessage(buffer);
     }
 
-    if (!("request" in parsed)) return close(1002, "invalid vless header");
-    const { request: vless } = parsed;
+    if (!("message" in parsed)) {
+      if (hooks.debug) {
+        console.error(
+          `vless header rejected: ${buffer.byteLength} bytes [${[...buffer.subarray(0, 24)].join(",")}]`,
+        );
+      }
+      return close(1002, "invalid vless header");
+    }
+    const { message: vless } = parsed;
     const payload = buffer.subarray(vless.headerLength);
 
     if (vless.command !== 1) return close(1003, "udp is not supported");
@@ -433,8 +495,9 @@ export async function runVlessSession(
     }
 
     // VLESS response header: version + addon length (0) — clients expect it.
+    // Nothing else may be sent before the upstream data: the payload belongs to
+    // the remote end (it is written by `pumpUp` below), not back to the client.
     sendBytes(server, [new Uint8Array([vless.version, 0])]);
-    if (payload.byteLength) sendBytes(server, [payload]);
 
     const writer = socket.writable.getWriter();
     const pumpUp = (async () => {
@@ -450,6 +513,13 @@ export async function runVlessSession(
       } finally {
         try {
           await writer.close();
+        } catch {
+          /* already closed */
+        }
+        // The client is gone: tear the upstream connection down instead of
+        // waiting for the remote end (a session must not outlive its client).
+        try {
+          socket.close();
         } catch {
           /* already closed */
         }
@@ -488,10 +558,20 @@ export async function runVlessSession(
   }
 }
 
-/** Reads the WebSocket upgrade body (Xray "?ed=" early data), if any. */
-async function readEarlyData(request: Request): Promise<Uint8Array> {
+/**
+ * Reads the WebSocket upgrade body (Xray `?ed=` early data), if any.
+ *
+ * A client that advertises early data writes the VLESS header into the body of
+ * the upgrade request; browsers/clients without it send the header as the first
+ * WebSocket frame instead. The read is capped so a stalled body cannot keep the
+ * handshake waiting.
+ */
+export async function readEarlyData(request: Request, timeoutMs = 3_000): Promise<Uint8Array> {
   try {
-    const body = await request.arrayBuffer();
+    const body = await Promise.race([
+      request.arrayBuffer(),
+      new Promise<ArrayBuffer>((resolve) => setTimeout(() => resolve(new ArrayBuffer(0)), timeoutMs)),
+    ]);
     return body.byteLength ? new Uint8Array(body) : new Uint8Array(0);
   } catch {
     return new Uint8Array(0);
@@ -512,10 +592,19 @@ export async function handleVlessSession(request: Request, options: ProxySession
   const client = pair[0];
   const server = pair[1];
   server.accept();
-  const early = await readEarlyData(request);
+  // Attach the listener synchronously: the client may have pipelined its first
+  // frame already, and workerd does not replay messages for a listener that is
+  // registered later.
+  const source = new WsSource(server, options.debug);
+  // Reading the body of an upgrade request is only meaningful for Xray-style
+  // early data (`?ed=`), and `request.arrayBuffer()` never resolves for a plain
+  // WebSocket upgrade — so it is read strictly on demand.
+  const wantsEarlyData = new URL(request.url).searchParams.has("ed");
+  const early = wantsEarlyData ? await readEarlyData(request) : new Uint8Array(0);
+  if (options.debug) console.log(`[proxy] upgrade accepted (early ${early.byteLength}B, state ${server.readyState})`);
   // The session must not be awaited here: the client only starts sending frames
   // after it receives the 101, so we hand it to the runtime and answer right away.
-  const session = runVlessSession(server, early, { debug: options.debug });
+  const session = runVlessSession(server, early, { debug: options.debug, source });
   if (options.waitUntil) options.waitUntil(session.catch(() => undefined));
   return new Response(null, { status: 101, webSocket: client } as ResponseInit);
 }

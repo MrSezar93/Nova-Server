@@ -1,0 +1,25 @@
+# ============================================================================
+#  Nova WARP — اجرای محلی خروجی Pages در همان ران‌تایم Workers (workerd)
+#
+#  این فایل فقط برای «پیش‌نمایش» است: بسته‌ی dist/pages/_worker.js را روی
+#  ران‌تایم واقعی اجرا می‌کند تا مطمئن شوید همان چیزی را که دیپلوی می‌کنید کار
+#  می‌کند.  برای انتشار روی Pages از دستور npm run deploy:pages استفاده کنید
+#  (تنظیمات binding و متغیرها در داشبورد Pages انجام می‌شود، نه از این فایل).
+#
+#      npm run build:pages && npm run preview:pages     → http://localhost:8789
+# ============================================================================
+
+name = "nova-warp-pages-preview"
+main = "dist/pages/_worker.js"
+compatibility_date = "2025-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+workers_dev = true
+
+# KV محلی (فقط برای همین پیش‌نمایش؛ داده‌ها در .wrangler/state ذخیره می‌شوند).
+[[kv_namespaces]]
+binding = "WARP_KV"
+id = "local-dev"
+
+[observability]
+enabled = false
